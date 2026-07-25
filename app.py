@@ -96,6 +96,33 @@ def whoami():
         return jsonify({"erreur": f"{type(e).__name__} - {e}"}), 500
 
 
+@app.route("/list_fichiers", methods=["GET"])
+def list_fichiers():
+    """
+    Diagnostic temporaire : liste tous les classeurs Google Sheets que le
+    compte de service peut réellement voir, directement depuis Google — pour
+    éliminer tout risque d'erreur de copier-coller dans un ID. À retirer une
+    fois le problème résolu.
+    """
+    try:
+        from googleapiclient.discovery import build
+
+        brut = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+        infos = json.loads(brut)
+        creds = Credentials.from_service_account_info(
+            infos, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+        )
+        service = build("drive", "v3", credentials=creds)
+        resultats = service.files().list(
+            q="mimeType='application/vnd.google-apps.spreadsheet'",
+            fields="files(id, name)",
+            pageSize=50,
+        ).execute()
+        return jsonify(resultats.get("files", []))
+    except Exception as e:
+        return jsonify({"erreur": f"{type(e).__name__} - {e}"}), 500
+
+
 @app.route("/verifier_connexion", methods=["POST"])
 def verifier_connexion():
     sheet_id, erreur = _verifier_cle_api()
