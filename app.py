@@ -72,6 +72,27 @@ def health():
     return jsonify({"status": "ok"})
 
 
+@app.route("/whoami", methods=["GET"])
+def whoami():
+    """
+    Diagnostic temporaire : confirme quelle identité Google le relais utilise
+    réellement, sans avoir à comparer des captures d'écran à l'œil. À retirer
+    une fois le problème de connexion résolu.
+    """
+    try:
+        brut = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+        if not brut:
+            return jsonify({"erreur": "GOOGLE_CREDENTIALS_JSON manquante."}), 500
+        infos = json.loads(brut)
+        return jsonify({
+            "client_email": infos.get("client_email"),
+            "project_id": infos.get("project_id"),
+            "private_key_id": infos.get("private_key_id"),
+        })
+    except Exception as e:
+        return jsonify({"erreur": f"{type(e).__name__} - {e}"}), 500
+
+
 @app.route("/verifier_connexion", methods=["POST"])
 def verifier_connexion():
     sheet_id, erreur = _verifier_cle_api()
