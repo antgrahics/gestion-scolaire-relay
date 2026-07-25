@@ -28,7 +28,10 @@ from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
 
 _client_gspread = None  # authentifié une seule fois, réutilisé (cache mémoire)
 
