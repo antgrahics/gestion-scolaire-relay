@@ -89,8 +89,13 @@ def verifier_connexion():
         wb = client_gspread().open_by_key(sheet_id)
         ws = wb.worksheet("UTILISATEURS")
         utilisateurs = ws.get_all_records()
+    except gspread.exceptions.APIError as e:
+        detail = getattr(e.response, "text", str(e))
+        return jsonify({"erreur": f"Erreur API Google ({e.response.status_code}) : {detail[:500]}"}), 502
+    except gspread.exceptions.WorksheetNotFound:
+        return jsonify({"erreur": "Onglet 'UTILISATEURS' introuvable dans ce classeur."}), 502
     except Exception as e:
-        return jsonify({"erreur": f"Impossible de lire le classeur : {e}"}), 502
+        return jsonify({"erreur": f"Impossible de lire le classeur : {type(e).__name__} - {e}"}), 502
 
     for u in utilisateurs:
         if u.get("Email", "").lower() != email.lower() or u.get("Actif", "") != "OUI":
