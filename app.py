@@ -92,6 +92,13 @@ def verifier_connexion():
     except gspread.exceptions.APIError as e:
         detail = getattr(e.response, "text", str(e))
         return jsonify({"erreur": f"Erreur API Google ({e.response.status_code}) sur sheet_id={sheet_id!r} : {detail[:500]}"}), 502
+    except gspread.exceptions.SpreadsheetNotFound as e:
+        # SpreadsheetNotFound cache la vraie réponse HTTP de Google dans ses
+        # arguments — on va la chercher pour voir le message réel au lieu
+        # du résumé générique "<Response [404]>".
+        reponse_brute = e.args[0] if e.args else None
+        detail = getattr(reponse_brute, "text", str(e))
+        return jsonify({"erreur": f"SpreadsheetNotFound sur sheet_id={sheet_id!r} — détail Google : {detail[:500]}"}), 502
     except gspread.exceptions.WorksheetNotFound:
         return jsonify({"erreur": f"Onglet 'UTILISATEURS' introuvable dans le classeur sheet_id={sheet_id!r}."}), 502
     except Exception as e:
