@@ -28,10 +28,7 @@ from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.readonly",
-]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 _client_gspread = None  # authentifié une seule fois, réutilisé (cache mémoire)
 
@@ -75,52 +72,34 @@ def health():
     return jsonify({"status": "ok"})
 
 
-@app.route("/whoami", methods=["GET"])
-def whoami():
+@app.route("/append_rows", methods=["POST"])
+def append_rows():
     """
-    Diagnostic temporaire : confirme quelle identité Google le relais utilise
-    réellement, sans avoir à comparer des captures d'écran à l'œil. À retirer
-    une fois le problème de connexion résolu.
+    Route générique : ajoute une ou plusieurs lignes à un onglet donné.
+    Utilisée par sync_queue.py (côté appli) pour rejouer la file d'attente
+    hors-ligne via le relais au lieu de gspread direct — commune à TOUS les
+    modules qui font des ajouts (élèves, notes, absences, écolage, annonces...),
+    pas seulement Élèves.
     """
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    onglet = corps.get("onglet")
+    lignes = corps.get("lignes")
+
+    if not onglet or not lignes:
+        return jsonify({"erreur": "onglet et lignes requis."}), 400
+
     try:
-        brut = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-        if not brut:
-            return jsonify({"erreur": "GOOGLE_CREDENTIALS_JSON manquante."}), 500
-        infos = json.loads(brut)
-        return jsonify({
-            "client_email": infos.get("client_email"),
-            "project_id": infos.get("project_id"),
-            "private_key_id": infos.get("private_key_id"),
-        })
+        wb = client_gspread().open_by_key(sheet_id)
+        ws = wb.worksheet(onglet)
+        ws.append_rows(lignes, value_input_option="USER_ENTERED")
     except Exception as e:
-        return jsonify({"erreur": f"{type(e).__name__} - {e}"}), 500
+        return jsonify({"erreur": f"Impossible d'écrire dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
-
-@app.route("/list_fichiers", methods=["GET"])
-def list_fichiers():
-    """
-    Diagnostic temporaire : liste tous les classeurs Google Sheets que le
-    compte de service peut réellement voir, directement depuis Google — pour
-    éliminer tout risque d'erreur de copier-coller dans un ID. À retirer une
-    fois le problème résolu.
-    """
-    try:
-        from googleapiclient.discovery import build
-
-        brut = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-        infos = json.loads(brut)
-        creds = Credentials.from_service_account_info(
-            infos, scopes=["https://www.googleapis.com/auth/drive.readonly"]
-        )
-        service = build("drive", "v3", credentials=creds)
-        resultats = service.files().list(
-            q="mimeType='application/vnd.google-apps.spreadsheet'",
-            fields="files(id, name)",
-            pageSize=50,
-        ).execute()
-        return jsonify(resultats.get("files", []))
-    except Exception as e:
-        return jsonify({"erreur": f"{type(e).__name__} - {e}"}), 500
+    return jsonify({"status": "ok"})
 
 
 @app.route("/verifier_connexion", methods=["POST"])
