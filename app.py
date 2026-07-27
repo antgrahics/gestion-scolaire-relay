@@ -102,6 +102,93 @@ def append_rows():
     return jsonify({"status": "ok"})
 
 
+@app.route("/get_records", methods=["POST"])
+def get_records():
+    """Lit tous les enregistrements d'un onglet (équivalent get_all_records)."""
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    onglet = corps.get("onglet")
+    head = corps.get("head", 1)
+
+    if not onglet:
+        return jsonify({"erreur": "onglet requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(sheet_id)
+        ws = wb.worksheet(onglet)
+        records = ws.get_all_records(head=head)
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible de lire l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
+
+    return jsonify({"records": records})
+
+
+@app.route("/modifier_ligne", methods=["POST"])
+def modifier_ligne():
+    """
+    Trouve une ligne par une valeur dans une colonne donnée, et la remplace.
+    Note : colonne_debut est une lettre simple (A-Z) — suffisant tant
+    qu'aucun onglet migré n'a plus de 26 colonnes.
+    """
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    onglet = corps.get("onglet")
+    valeur_recherche = corps.get("valeur_recherche")
+    nouvelle_ligne = corps.get("nouvelle_ligne")
+    colonne_recherche = corps.get("colonne_recherche", 1)
+    colonne_debut = corps.get("colonne_debut", "A")
+
+    if not onglet or valeur_recherche is None or nouvelle_ligne is None:
+        return jsonify({"erreur": "onglet, valeur_recherche et nouvelle_ligne requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(sheet_id)
+        ws = wb.worksheet(onglet)
+        cell = ws.find(str(valeur_recherche), in_column=colonne_recherche)
+        if not cell:
+            return jsonify({"erreur": f"Ligne introuvable pour {valeur_recherche!r}."}), 404
+        colonne_fin = chr(ord(colonne_debut) + len(nouvelle_ligne) - 1)
+        ws.update(f"{colonne_debut}{cell.row}:{colonne_fin}{cell.row}", [nouvelle_ligne])
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible de modifier l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
+
+    return jsonify({"status": "ok"})
+
+
+@app.route("/supprimer_ligne", methods=["POST"])
+def supprimer_ligne():
+    """Trouve une ligne par une valeur dans une colonne donnée, et la supprime.
+    Silencieux si non trouvée (cohérent avec le comportement existant côté appli)."""
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    onglet = corps.get("onglet")
+    valeur_recherche = corps.get("valeur_recherche")
+    colonne_recherche = corps.get("colonne_recherche", 1)
+
+    if not onglet or valeur_recherche is None:
+        return jsonify({"erreur": "onglet et valeur_recherche requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(sheet_id)
+        ws = wb.worksheet(onglet)
+        cell = ws.find(str(valeur_recherche), in_column=colonne_recherche)
+        if cell:
+            ws.delete_rows(cell.row)
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible de supprimer dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
+
+    return jsonify({"status": "ok"})
+
+
 @app.route("/verifier_connexion", methods=["POST"])
 def verifier_connexion():
     sheet_id, erreur = _verifier_cle_api()
