@@ -189,6 +189,52 @@ def supprimer_ligne():
     return jsonify({"status": "ok"})
 
 
+@app.route("/modifier_cellule", methods=["POST"])
+def modifier_cellule():
+    """
+    Trouve une ligne par DEUX critères combinés (colonne_recherche_1 ==
+    valeur_recherche_1 ET colonne_recherche_2 == valeur_recherche_2), et met
+    à jour uniquement la cellule colonne_cible. Utile quand un seul critère
+    (comme dans /modifier_ligne) risquerait de matcher la mauvaise ligne
+    (ex : un élève avec plusieurs paiements dans ECOLAGE).
+    """
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    onglet = corps.get("onglet")
+    colonne_recherche_1 = corps.get("colonne_recherche_1")
+    valeur_recherche_1 = corps.get("valeur_recherche_1")
+    colonne_recherche_2 = corps.get("colonne_recherche_2")
+    valeur_recherche_2 = corps.get("valeur_recherche_2")
+    colonne_cible = corps.get("colonne_cible")
+    nouvelle_valeur = corps.get("nouvelle_valeur")
+
+    if not onglet or None in (colonne_recherche_1, valeur_recherche_1,
+                               colonne_recherche_2, valeur_recherche_2,
+                               colonne_cible, nouvelle_valeur):
+        return jsonify({"erreur": "onglet, colonne_recherche_1/2, valeur_recherche_1/2, "
+                                   "colonne_cible et nouvelle_valeur requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(sheet_id)
+        ws = wb.worksheet(onglet)
+        toutes_lignes = ws.get_all_values()
+
+        for i, ligne in enumerate(toutes_lignes[1:], start=2):  # ligne 1 = en-têtes
+            val_1 = ligne[colonne_recherche_1 - 1] if len(ligne) >= colonne_recherche_1 else ""
+            val_2 = ligne[colonne_recherche_2 - 1] if len(ligne) >= colonne_recherche_2 else ""
+            if str(val_1).strip() == str(valeur_recherche_1).strip() and \
+               str(val_2).strip() == str(valeur_recherche_2).strip():
+                ws.update_cell(i, colonne_cible, nouvelle_valeur)
+                return jsonify({"status": "ok"})
+
+        return jsonify({"erreur": "Ligne introuvable pour ces critères."}), 404
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible de modifier l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
+
+
 @app.route("/verifier_connexion", methods=["POST"])
 def verifier_connexion():
     sheet_id, erreur = _verifier_cle_api()
