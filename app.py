@@ -235,6 +235,65 @@ def modifier_cellule():
         return jsonify({"erreur": f"Impossible de modifier l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
 
+@app.route("/get_values", methods=["POST"])
+def get_values():
+    """Lit toutes les valeurs brutes (grille) d'un onglet — équivalent
+    get_all_values(). Utile pour les feuilles à structure libre (comme
+    CONFIGURATION, plusieurs blocs de colonnes côte à côte) que
+    get_records() (get_all_records, une seule table à en-têtes) ne peut
+    pas gérer."""
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    onglet = corps.get("onglet")
+
+    if not onglet:
+        return jsonify({"erreur": "onglet requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(sheet_id)
+        ws = wb.worksheet(onglet)
+        valeurs = ws.get_all_values()
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible de lire l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
+
+    return jsonify({"valeurs": valeurs})
+
+
+@app.route("/ecrire_cellule", methods=["POST"])
+def ecrire_cellule():
+    """
+    Écrit une valeur dans UNE cellule précise (ligne/colonne, sans recherche).
+    Utile pour insérer dans la première case libre d'une colonne dans un
+    onglet à structure libre (ex : CONFIGURATION — plusieurs blocs de
+    colonnes côte à côte, où le "prochain emplacement libre" est déterminé
+    côté appli à partir de /get_values, pas par une recherche de valeur).
+    """
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    onglet = corps.get("onglet")
+    ligne = corps.get("ligne")
+    colonne = corps.get("colonne")
+    valeur = corps.get("valeur")
+
+    if not onglet or ligne is None or colonne is None:
+        return jsonify({"erreur": "onglet, ligne et colonne requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(sheet_id)
+        ws = wb.worksheet(onglet)
+        ws.update_cell(ligne, colonne, valeur)
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible d'écrire dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
+
+    return jsonify({"status": "ok"})
+
+
 @app.route("/verifier_connexion", methods=["POST"])
 def verifier_connexion():
     sheet_id, erreur = _verifier_cle_api()
