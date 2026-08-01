@@ -22,6 +22,7 @@ import os
 import json
 import bcrypt
 import hashlib
+from datetime import date
 from flask import Flask, request, jsonify
 import gspread
 from google.oauth2.service_account import Credentials
@@ -233,6 +234,148 @@ def modifier_cellule():
         return jsonify({"erreur": "Ligne introuvable pour ces critères."}), 404
     except Exception as e:
         return jsonify({"erreur": f"Impossible de modifier l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
+
+
+@app.route("/get_values", methods=["POST"])
+def get_values():
+    """Lit toutes les valeurs brutes (grille) d'un onglet — équivalent
+    get_all_values(). Utile pour les feuilles à structure libre (comme
+    CONFIGURATION, plusieurs blocs de colonnes côte à côte) que
+    get_records() (get_all_records, une seule table à en-têtes) ne peut
+    pas gérer."""
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    onglet = corps.get("onglet")
+
+    if not onglet:
+        return jsonify({"erreur": "onglet requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(sheet_id)
+        ws = wb.worksheet(onglet)
+        valeurs = ws.get_all_values()
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible de lire l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
+
+    return jsonify({"valeurs": valeurs})
+
+
+@app.route("/ecrire_cellule", methods=["POST"])
+def ecrire_cellule():
+    """
+    Écrit une valeur dans UNE cellule précise (ligne/colonne, sans recherche).
+    Utile pour insérer dans la première case libre d'une colonne dans un
+    onglet à structure libre (ex : CONFIGURATION — plusieurs blocs de
+    colonnes côte à côte, où le "prochain emplacement libre" est déterminé
+    côté appli à partir de /get_values, pas par une recherche de valeur).
+    """
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    onglet = corps.get("onglet")
+    ligne = corps.get("ligne")
+    colonne = corps.get("colonne")
+    valeur = corps.get("valeur")
+
+    if not onglet or ligne is None or colonne is None:
+        return jsonify({"erreur": "onglet, ligne et colonne requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(sheet_id)
+        ws = wb.worksheet(onglet)
+        ws.update_cell(ligne, colonne, valeur)
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible d'écrire dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
+
+    return jsonify({"status": "ok"})
+
+
+def registre_sheet_id():
+    """ID FIXE du classeur Registre (années scolaires) — un seul, partagé,
+    indépendant de la clé API de chaque établissement."""
+    sid = os.environ.get("REGISTRE_SHEET_ID")
+    if not sid:
+        raise RuntimeError("Variable d'environnement REGISTRE_SHEET_ID manquante.")
+    return sid
+
+
+NOM_ONGLET_ANNEES = "ANNEES"
+
+
+@app.route("/registre/annee_active", methods=["POST"])
+def registre_annee_active():
+    """Retourne la ligne (dict) de l'année marquée 'Active' dans le
+    registre, ou {"annee": None} si aucune."""
+    _, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    try:
+        wb = client_gspread().open_by_key(registre_sheet_id())
+        ws = wb.worksheet(NOM_ONGLET_ANNEES)
+        lignes = ws.get_all_records()
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible de lire le registre : {type(e).__name__} - {e}"}), 502
+
+    for ligne in lignes:
+        if ligne.get("Statut") == "Active":
+            return jsonify({"annee": ligne})
+    return jsonify({"annee": None})
+
+
+@app.route("/registre/enregistrer_nouvelle_annee", methods=["POST"])
+def registre_enregistrer_nouvelle_annee():
+    """Ajoute une nouvelle ligne 'Active' dans le registre — appelé à la
+    clôture d'année, juste après la création du nouveau classeur."""
+    _, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    annee = corps.get("annee")
+    spreadsheet_id = corps.get("spreadsheet_id")
+    if not annee or not spreadsheet_id:
+        return jsonify({"erreur": "annee et spreadsheet_id requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(registre_sheet_id())
+        ws = wb.worksheet(NOM_ONGLET_ANNEES)
+        ws.append_row([annee, spreadsheet_id, "Active", ""])
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible d'écrire dans le registre : {type(e).__name__} - {e}"}), 502
+
+    return jsonify({"status": "ok"})
+
+
+@app.route("/registre/archiver_annee", methods=["POST"])
+def registre_archiver_annee():
+    """Passe une année de 'Active' à 'Archivée', avec la date du jour."""
+    _, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    annee = corps.get("annee")
+    if not annee:
+        return jsonify({"erreur": "annee requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(registre_sheet_id())
+        ws = wb.worksheet(NOM_ONGLET_ANNEES)
+        cell = ws.find(annee)
+        if not cell:
+            return jsonify({"erreur": f"Année introuvable dans le registre : {annee}"}), 404
+        ws.update_cell(cell.row, 3, "Archivée")
+        ws.update_cell(cell.row, 4, date.today().strftime("%d/%m/%Y"))
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible d'archiver dans le registre : {type(e).__name__} - {e}"}), 502
+
+    return jsonify({"status": "ok"})
 
 
 @app.route("/verifier_connexion", methods=["POST"])
