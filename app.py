@@ -295,7 +295,6 @@ def ecrire_cellule():
     return jsonify({"status": "ok"})
 
 
-<<<<<<< HEAD
 def registre_sheet_id():
     """ID FIXE du classeur Registre (années scolaires) — un seul, partagé,
     indépendant de la clé API de chaque établissement."""
@@ -379,8 +378,6 @@ def registre_archiver_annee():
     return jsonify({"status": "ok"})
 
 
-=======
->>>>>>> 5bffb7f3a3d0659582b2f259ab132f88f2b3e315
 @app.route("/verifier_connexion", methods=["POST"])
 def verifier_connexion():
     sheet_id, erreur = _verifier_cle_api()
