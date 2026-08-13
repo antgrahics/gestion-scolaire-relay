@@ -236,6 +236,51 @@ def modifier_cellule():
         return jsonify({"erreur": f"Impossible de modifier l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
 
+@app.route("/remplacer_lignes_cle", methods=["POST"])
+def remplacer_lignes_cle():
+    """
+    Remplace, en UN seul aller-retour, toutes les lignes d'un onglet où
+    colonne_cle vaut valeur_cle par nouvelles_lignes (garde le reste de
+    l'onglet intact, garde la ligne d'en-têtes). Le filtrage + la
+    réécriture se font ici, côté serveur — évite au poste local de faire
+    un aller-retour par ligne à supprimer.
+    """
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    onglet = corps.get("onglet")
+    colonne_cle = corps.get("colonne_cle")
+    valeur_cle = corps.get("valeur_cle")
+    nouvelles_lignes = corps.get("nouvelles_lignes")
+
+    if not onglet or colonne_cle is None or valeur_cle is None or nouvelles_lignes is None:
+        return jsonify({"erreur": "onglet, colonne_cle, valeur_cle et nouvelles_lignes requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(sheet_id)
+        ws = wb.worksheet(onglet)
+        toutes_lignes = ws.get_all_values()
+
+        if not toutes_lignes:
+            lignes_finales = nouvelles_lignes
+        else:
+            entetes = toutes_lignes[0]
+            lignes_finales = [entetes]
+            for ligne in toutes_lignes[1:]:
+                val = ligne[colonne_cle - 1] if len(ligne) >= colonne_cle else ""
+                if str(val).strip() != str(valeur_cle).strip():
+                    lignes_finales.append(ligne)
+            lignes_finales.extend(nouvelles_lignes)
+
+        ws.clear()
+        ws.update("A1", lignes_finales)
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible de remplacer dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
+
+    return jsonify({"status": "ok"})
+
 @app.route("/get_values", methods=["POST"])
 def get_values():
     """Lit toutes les valeurs brutes (grille) d'un onglet — équivalent
