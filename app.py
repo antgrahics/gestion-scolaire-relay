@@ -189,6 +189,48 @@ def supprimer_ligne():
 
     return jsonify({"status": "ok"})
 
+@app.route("/supprimer_ligne_criteres", methods=["POST"])
+def supprimer_ligne_criteres():
+    """
+    Trouve une ligne par PLUSIEURS critères combinés (liste de paires
+    colonne/valeur, toutes doivent correspondre) et la supprime. Utile
+    quand un seul critère (comme /supprimer_ligne) risquerait de
+    supprimer la mauvaise ligne — ex : EMPLOI_DU_TEMPS, où seul le
+    triplet Prof + Jour + Créneau est unique.
+    """
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    onglet = corps.get("onglet")
+    criteres = corps.get("criteres")  # liste de {"colonne": int, "valeur": ...}
+
+    if not onglet or not criteres:
+        return jsonify({"erreur": "onglet et criteres requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(sheet_id)
+        ws = wb.worksheet(onglet)
+        toutes_lignes = ws.get_all_values()
+
+        for i, ligne in enumerate(toutes_lignes[1:], start=2):  # ligne 1 = en-têtes
+            match = True
+            for c in criteres:
+                col = c["colonne"]
+                val = ligne[col - 1] if len(ligne) >= col else ""
+                if str(val).strip() != str(c["valeur"]).strip():
+                    match = False
+                    break
+            if match:
+                ws.delete_rows(i)
+                break
+        # Silencieux si non trouvée (cohérent avec /supprimer_ligne)
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible de supprimer dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
+
+    return jsonify({"status": "ok"})
+
 
 @app.route("/modifier_cellule", methods=["POST"])
 def modifier_cellule():
