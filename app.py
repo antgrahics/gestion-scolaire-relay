@@ -532,3 +532,81 @@ def verifier_connexion():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
+@app.route("/ecrire_param_config", methods=["POST"])
+def ecrire_param_config():
+    """
+    Upsert clé/valeur dans un onglet type CONFIGURATION : cherche une
+    ligne où colonne_cle == cle ; si trouvée, met à jour colonne_valeur ;
+    sinon cherche la première ligne (à partir de ligne_depart) où
+    colonne_cle est vide et l'utilise ; sinon ajoute une nouvelle ligne.
+    """
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    onglet = corps.get("onglet")
+    colonne_cle = corps.get("colonne_cle")
+    colonne_valeur = corps.get("colonne_valeur")
+    cle = corps.get("cle")
+    valeur = corps.get("valeur")
+    ligne_depart = corps.get("ligne_depart", 1)
+
+    if not onglet or colonne_cle is None or colonne_valeur is None or cle is None or valeur is None:
+        return jsonify({"erreur": "onglet, colonne_cle, colonne_valeur, cle et valeur requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(sheet_id)
+        ws = wb.worksheet(onglet)
+        data = ws.get_all_values()
+
+        for i, row in enumerate(data, start=1):
+            if len(row) >= colonne_cle and str(row[colonne_cle - 1]).strip().upper() == str(cle).upper():
+                ws.update_cell(i, colonne_valeur, valeur)
+                return jsonify({"status": "ok"})
+
+        for i, row in enumerate(data[ligne_depart - 1:], start=ligne_depart):
+            vide = len(row) < colonne_cle or not row[colonne_cle - 1]
+            if vide:
+                ws.update_cell(i, colonne_cle, str(cle).upper())
+                ws.update_cell(i, colonne_valeur, valeur)
+                return jsonify({"status": "ok"})
+
+        nouvelle_ligne = len(data) + 1
+        ws.update_cell(nouvelle_ligne, colonne_cle, str(cle).upper())
+        ws.update_cell(nouvelle_ligne, colonne_valeur, valeur)
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible d'écrire dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
+
+
+@app.route("/vider_params_prefixe", methods=["POST"])
+def vider_params_prefixe():
+    """Vide (met à '') colonne_cle et colonne_valeur pour toutes les lignes
+    où colonne_cle commence par un préfixe donné — sert à réinitialiser un
+    groupe de clés (ex : toutes les MENTION_xx) avant de les réécrire."""
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    onglet = corps.get("onglet")
+    colonne_cle = corps.get("colonne_cle")
+    colonne_valeur = corps.get("colonne_valeur")
+    prefixe = corps.get("prefixe")
+
+    if not onglet or colonne_cle is None or colonne_valeur is None or not prefixe:
+        return jsonify({"erreur": "onglet, colonne_cle, colonne_valeur et prefixe requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(sheet_id)
+        ws = wb.worksheet(onglet)
+        data = ws.get_all_values()
+        for i, row in enumerate(data, start=1):
+            if len(row) >= colonne_cle and str(row[colonne_cle - 1]).strip().upper().startswith(prefixe.upper()):
+                ws.update_cell(i, colonne_cle, "")
+                ws.update_cell(i, colonne_valeur, "")
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible de vider dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
