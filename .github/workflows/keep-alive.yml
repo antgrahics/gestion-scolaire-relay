@@ -1,0 +1,14 @@
+name: Garder le relais éveillé
+
+on:
+  schedule:
+    # Toutes les 10 min, 6h-18h UTC (= heure de Lomé), du lundi au vendredi
+    - cron: "*/10 6-18 * * 1-5"
+  workflow_dispatch:   # permet de le lancer manuellement depuis l'onglet Actions
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /health
+        run: curl -f https://gestion-scolaire-relay.onrender.com/health
