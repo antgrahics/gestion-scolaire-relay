@@ -610,3 +610,47 @@ def vider_params_prefixe():
         return jsonify({"status": "ok"})
     except Exception as e:
         return jsonify({"erreur": f"Impossible de vider dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
+
+@app.route("/colorer_cellule", methods=["POST"])
+def colorer_cellule():
+    """
+    Cherche une ligne par une valeur de clé (colonne_recherche/valeur_recherche)
+    et applique une couleur de fond à une cellule cible de cette ligne.
+    Utilisé pour le statut vert/rouge des préinscriptions validées/rejetées.
+    """
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    onglet = corps.get("onglet")
+    colonne_recherche = corps.get("colonne_recherche")
+    valeur_recherche = corps.get("valeur_recherche")
+    colonne_cible = corps.get("colonne_cible")
+    couleur = corps.get("couleur", "")  # "vert" | "rouge" | ""
+
+    if not onglet or colonne_recherche is None or valeur_recherche is None or colonne_cible is None:
+        return jsonify({"erreur": "onglet, colonne_recherche, valeur_recherche et colonne_cible requis."}), 400
+
+    couleurs = {
+        "vert":  {"red": 0.80, "green": 0.94, "blue": 0.80},
+        "rouge": {"red": 0.98, "green": 0.80, "blue": 0.80},
+        "":      {"red": 1.0,  "green": 1.0,  "blue": 1.0},
+    }
+    rgb = couleurs.get(couleur, couleurs[""])
+
+    try:
+        wb = client_gspread().open_by_key(sheet_id)
+        ws = wb.worksheet(onglet)
+        toutes_lignes = ws.get_all_values()
+
+        for i, ligne in enumerate(toutes_lignes, start=1):
+            val = ligne[colonne_recherche - 1] if len(ligne) >= colonne_recherche else ""
+            if str(val).strip() == str(valeur_recherche).strip():
+                case = gspread.utils.rowcol_to_a1(i, colonne_cible)
+                ws.format(case, {"backgroundColor": rgb})
+                return jsonify({"status": "ok"})
+
+        return jsonify({"erreur": f"Ligne introuvable pour {valeur_recherche!r}."}), 404
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible de colorer dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
