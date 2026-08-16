@@ -611,6 +611,39 @@ def vider_params_prefixe():
     except Exception as e:
         return jsonify({"erreur": f"Impossible de vider dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
+@app.route("/remplacer_onglet", methods=["POST"])
+def remplacer_onglet():
+    """
+    Remplace tout le contenu d'un onglet (vide + réécrit) en un seul
+    aller-retour, en le créant s'il n'existe pas encore. Utilisé pour les
+    grilles complètes (ex : TARIFS_ECOLAGE) recalculées en entier côté
+    appli à chaque sauvegarde.
+    """
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    onglet = corps.get("onglet")
+    lignes = corps.get("lignes")
+
+    if not onglet or lignes is None:
+        return jsonify({"erreur": "onglet et lignes requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(sheet_id)
+        try:
+            ws = wb.worksheet(onglet)
+        except gspread.exceptions.WorksheetNotFound:
+            nb_cols = max(10, len(lignes[0]) if lignes else 10)
+            ws = wb.add_worksheet(title=onglet, rows="100", cols=str(nb_cols))
+        ws.clear()
+        if lignes:
+            ws.update("A1", lignes)
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible de remplacer l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
+
 @app.route("/colorer_cellule", methods=["POST"])
 def colorer_cellule():
     """
