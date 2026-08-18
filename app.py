@@ -18,6 +18,7 @@ Variables d'environnement nécessaires (configurées sur Render, jamais
     {"cle-api-olivier": "1T_-_ESM4_fiz8q4WbYgr7k6wFegsl_HP0cPeegHhx4"}
 """
 
+import time
 import os
 import json
 import bcrypt
@@ -104,6 +105,26 @@ def append_rows():
 
 
 @app.route("/get_records", methods=["POST"])
+def _appel_avec_retry(fonction, tentatives=2, delai=3):
+    """
+    Exécute fonction() et, si Google renvoie une erreur de quota (429),
+    réessaie une fois après une courte pause au lieu d'abandonner tout de
+    suite. Utile quand l'appli cliente lit une dizaine d'onglets d'un coup
+    au démarrage et tape le plafond "Read requests per minute".
+    """
+    derniere_erreur = None
+    for tentative in range(tentatives):
+        try:
+            return fonction()
+        except Exception as e:
+            derniere_erreur = e
+            if "429" in str(e) or "Quota exceeded" in str(e):
+                if tentative < tentatives - 1:
+                    time.sleep(delai)
+                    continue
+            raise
+    raise derniere_erreur
+
 def get_records():
     """Lit tous les enregistrements d'un onglet (équivalent get_all_records)."""
     sheet_id, erreur = _verifier_cle_api()
@@ -120,7 +141,7 @@ def get_records():
     try:
         wb = client_gspread().open_by_key(sheet_id)
         ws = wb.worksheet(onglet)
-        records = ws.get_all_records(head=head)
+        records = _appel_avec_retry(lambda: ws.get_all_records(head=head))
     except Exception as e:
         return jsonify({"erreur": f"Impossible de lire l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
@@ -343,7 +364,7 @@ def get_values():
     try:
         wb = client_gspread().open_by_key(sheet_id)
         ws = wb.worksheet(onglet)
-        valeurs = ws.get_all_values()
+        valeurs = _appel_avec_retry(lambda: ws.get_all_values())
     except Exception as e:
         return jsonify({"erreur": f"Impossible de lire l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
