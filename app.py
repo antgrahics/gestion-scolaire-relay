@@ -103,8 +103,6 @@ def append_rows():
 
     return jsonify({"status": "ok"})
 
-
-@app.route("/get_records", methods=["POST"])
 def _appel_avec_retry(fonction, tentatives=2, delai=3):
     """
     Exécute fonction() et, si Google renvoie une erreur de quota (429),
@@ -125,6 +123,8 @@ def _appel_avec_retry(fonction, tentatives=2, delai=3):
             raise
     raise derniere_erreur
 
+
+@app.route("/get_records", methods=["POST"])
 def get_records():
     """Lit tous les enregistrements d'un onglet (équivalent get_all_records)."""
     sheet_id, erreur = _verifier_cle_api()
