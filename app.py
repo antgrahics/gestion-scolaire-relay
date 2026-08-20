@@ -1,21 +1,10 @@
 """
-app.py — Relais gestion_scolaire
+app.py — Relais gestion_scolaire (CORRIGE)
 
-Rôle : porter credentials.json (compte de service Google) UNE SEULE FOIS,
-côté serveur, au lieu d'une copie sur chaque poste (secrétaire, prof,
-surveillant, censeur...). Les postes locaux appellent ce service en HTTPS,
-avec une clé API propre à leur établissement — jamais Google directement.
-
-Phase 2 — pilote : un seul endpoint (/verifier_connexion) pour valider
-l'approche de bout en bout avant de migrer le reste (élèves, notes,
-absences, écolage...).
-
-Variables d'environnement nécessaires (configurées sur Render, jamais
-écrites dans un fichier versionné) :
-  - GOOGLE_CREDENTIALS_JSON : le contenu complet de credentials.json (le JSON
-    du compte de service), collé tel quel comme valeur de variable d'env.
-  - ETABLISSEMENTS_JSON : mapping clé API -> Sheet_ID, ex:
-    {"cle-api-olivier": "1T_-_ESM4_fiz8q4WbYgr7k6wFegsl_HP0cPeegHhx4"}
+Variables d'environnement Render :
+  - GOOGLE_CREDENTIALS_JSON : contenu JSON du compte de service
+  - REGISTRE_SHEET_ID : ID fixe du classeur Registre
+  - ETABLISSEMENTS_JSON (optionnel) : fallback JSON statique
 """
 
 import time
@@ -23,93 +12,113 @@ import os
 import json
 import bcrypt
 import hashlib
-from datetime import date
+import secrets
+from datetime import date, datetime
 from flask import Flask, request, jsonify
 import gspread
 from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+# ── SCOPES ───────────────────────────────────────────────────────────────────
+# Drive est inclus pour les futures opérations (clôture d'année, copie classeur)
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
-_client_gspread = None  # authentifié une seule fois, réutilisé (cache mémoire)
+# ── CLIENT GSPREAD (cache mémoire) ─────────────────────────────────────────
+_client_gspread = None
+
+
+def _clean_env_json(raw: str) -> str:
+    """Nettoie les échappements de Render (guillemets et \n échappés)."""
+    raw = raw.strip()
+    if raw.startswith('"') and raw.endswith('"'):
+        raw = raw[1:-1].replace('\\n', '\n').replace('\\"', '"')
+    return raw
 
 
 def client_gspread():
-    """Authentifie le compte de service à partir de la variable d'environnement,
-    jamais depuis un fichier sur disque. Mis en cache en mémoire pour ne pas
-    refaire l'authentification à chaque requête."""
+    """Authentifie le compte de service depuis la variable d'environnement."""
     global _client_gspread
     if _client_gspread is None:
-        brut = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+        brut = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
         if not brut:
             raise RuntimeError("Variable d'environnement GOOGLE_CREDENTIALS_JSON manquante.")
-        infos = json.loads(brut)
+        try:
+            infos = json.loads(_clean_env_json(brut))
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"GOOGLE_CREDENTIALS_JSON invalide : {e}")
         creds = Credentials.from_service_account_info(infos, scopes=SCOPES)
         _client_gspread = gspread.authorize(creds)
     return _client_gspread
 
 
-def sheet_id_pour_cle_api(cle_api: str):
-    """Retourne le Sheet_ID de l'établissement associé à cette clé API, ou None."""
+# ── REGISTRE ─────────────────────────────────────────────────────────────────
+def registre_sheet_id():
+    sid = os.environ.get("REGISTRE_SHEET_ID")
+    if not sid:
+        raise RuntimeError("Variable d'environnement REGISTRE_SHEET_ID manquante.")
+    return sid
+
+
+# ── ETABLISSEMENTS (mapping clé API → Sheet_ID) ──────────────────────────────
+# Cache mémoire avec TTL (5 min) pour ne pas taper Google à chaque requête
+_cache_etablissements = {"data": {}, "expires": 0}
+
+
+def _charger_etablissements():
+    """Charge le mapping depuis ETABLISSEMENTS_JSON (env) ou le Registre Sheets."""
+    global _cache_etablissements
+    maintenant = time.time()
+    
+    if maintenant < _cache_etablissements["expires"]:
+        return _cache_etablissements["data"]
+
+    mapping = {}
+
+    # 1. Fallback variable d'environnement (rapide, tests)
     brut = os.environ.get("ETABLISSEMENTS_JSON", "{}")
-    mapping = json.loads(brut)
-    return mapping.get(cle_api)
+    try:
+        mapping.update(json.loads(_clean_env_json(brut)))
+    except json.JSONDecodeError:
+        pass
+
+    # 2. Source principale : onglet ETABLISSEMENTS dans le Registre
+    try:
+        wb = client_gspread().open_by_key(registre_sheet_id())
+        try:
+            ws = wb.worksheet("ETABLISSEMENTS")
+            for row in ws.get_all_records():
+                cle = str(row.get("Cle_API", "")).strip()
+                sid = str(row.get("Sheet_ID", "")).strip()
+                if cle and sid:
+                    mapping[cle] = sid
+        except gspread.exceptions.WorksheetNotFound:
+            pass  # pas encore créé, pas grave
+    except Exception as e:
+        print(f"[WARN] Impossible de lire le Registre ETABLISSEMENTS : {e}")
+
+    _cache_etablissements = {"data": mapping, "expires": maintenant + 300}
+    return mapping
+
+
+def sheet_id_pour_cle_api(cle_api: str):
+    return _charger_etablissements().get(cle_api)
 
 
 def _verifier_cle_api():
-    """Vérifie le header X-API-Key. Retourne (sheet_id, None) si valide,
-    (None, réponse_erreur) sinon."""
-    cle_api = request.headers.get("X-API-Key", "")
+    """Vérifie le header X-API-Key."""
+    cle_api = request.headers.get("X-API-Key", "").strip()
     sheet_id = sheet_id_pour_cle_api(cle_api)
     if not sheet_id:
         return None, (jsonify({"erreur": "Clé API invalide ou inconnue."}), 401)
     return sheet_id, None
 
 
-@app.route("/health", methods=["GET"])
-def health():
-    """Route de vie — utilisée aussi par le ping GitHub Actions pour
-    empêcher le service de s'endormir pendant les heures d'école."""
-    return jsonify({"status": "ok"})
-
-
-@app.route("/append_rows", methods=["POST"])
-def append_rows():
-    """
-    Route générique : ajoute une ou plusieurs lignes à un onglet donné.
-    Utilisée par sync_queue.py (côté appli) pour rejouer la file d'attente
-    hors-ligne via le relais au lieu de gspread direct — commune à TOUS les
-    modules qui font des ajouts (élèves, notes, absences, écolage, annonces...),
-    pas seulement Élèves.
-    """
-    sheet_id, erreur = _verifier_cle_api()
-    if erreur:
-        return erreur
-
-    corps = request.get_json(silent=True) or {}
-    onglet = corps.get("onglet")
-    lignes = corps.get("lignes")
-
-    if not onglet or not lignes:
-        return jsonify({"erreur": "onglet et lignes requis."}), 400
-
-    try:
-        wb = client_gspread().open_by_key(sheet_id)
-        ws = wb.worksheet(onglet)
-        ws.append_rows(lignes, value_input_option="USER_ENTERED")
-    except Exception as e:
-        return jsonify({"erreur": f"Impossible d'écrire dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
-
-    return jsonify({"status": "ok"})
-
+# ── UTILITAIRES ─────────────────────────────────────────────────────────────
 def _appel_avec_retry(fonction, tentatives=2, delai=3):
-    """
-    Exécute fonction() et, si Google renvoie une erreur de quota (429),
-    réessaie une fois après une courte pause au lieu d'abandonner tout de
-    suite. Utile quand l'appli cliente lit une dizaine d'onglets d'un coup
-    au démarrage et tape le plafond "Read requests per minute".
-    """
     derniere_erreur = None
     for tentative in range(tentatives):
         try:
@@ -124,9 +133,125 @@ def _appel_avec_retry(fonction, tentatives=2, delai=3):
     raise derniere_erreur
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  ROUTES
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
+
+
+# ── ENREGISTREMENT D'UN NOUVEL ETABLISSEMENT ────────────────────────────────
+@app.route("/enregistrer_etablissement", methods=["POST"])
+def enregistrer_etablissement():
+    """
+    Appelé par le desktop au moment du setup initial.
+    Génère une clé API, l'enregistre dans le Registre (onglet ETABLISSEMENTS),
+    et retourne la clé au client pour qu'il la sauvegarde localement.
+    """
+    corps = request.get_json(silent=True) or {}
+    nom = corps.get("nom_etablissement", "").strip()
+    sheet_id = corps.get("sheet_id", "").strip()
+    registre_id = corps.get("registre_sheet_id", "").strip()
+
+    if not nom or not sheet_id:
+        return jsonify({"erreur": "nom_etablissement et sheet_id requis."}), 400
+
+    # Génère une clé API sécurisée
+    cle_api = f"AG-{int(time.time())}-{secrets.token_hex(8).upper()}"
+
+    try:
+        # Utilise le registre fourni ou celui de l'env
+        rid = registre_id or registre_sheet_id()
+        wb = client_gspread().open_by_key(rid)
+        
+        try:
+            ws = wb.worksheet("ETABLISSEMENTS")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = wb.add_worksheet("ETABLISSEMENTS", rows=100, cols=4)
+            ws.append_row(["Cle_API", "Sheet_ID", "Nom_Etablissement", "Date_Creation"])
+
+        ws.append_row([
+            cle_api,
+            sheet_id,
+            nom,
+            datetime.now().strftime("%d/%m/%Y %H:%M")
+        ])
+        
+        # Invalide le cache mémoire pour forcer le rechargement
+        _cache_etablissements["expires"] = 0
+        
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible d'écrire dans le registre : {type(e).__name__} - {e}"}), 502
+
+    return jsonify({"cle_api": cle_api, "sheet_id": sheet_id}), 200
+
+
+# ── VERIFIER CONNEXION ──────────────────────────────────────────────────────
+@app.route("/verifier_connexion", methods=["POST"])
+def verifier_connexion():
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    email = (corps.get("email") or "").strip()
+    mot_de_passe = corps.get("mot_de_passe") or ""
+
+    if not email or not mot_de_passe:
+        return jsonify({"erreur": "email et mot_de_passe requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(sheet_id)
+        ws = wb.worksheet("UTILISATEURS")
+        utilisateurs = ws.get_all_records()
+    except gspread.exceptions.APIError as e:
+        detail = getattr(e.response, "text", str(e))
+        return jsonify({"erreur": f"Erreur API Google : {detail[:500]}"}), 502
+    except gspread.exceptions.SpreadsheetNotFound:
+        return jsonify({"erreur": "Classeur introuvable."}), 502
+    except gspread.exceptions.WorksheetNotFound:
+        return jsonify({"erreur": "Onglet UTILISATEURS introuvable."}), 502
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible de lire le classeur : {type(e).__name__} - {e}"}), 502
+
+    for u in utilisateurs:
+        if u.get("Email", "").lower() != email.lower() or u.get("Actif", "") != "OUI":
+            continue
+
+        hash_stocke = u.get("Mot_de_passe_hash", "")
+
+        if hash_stocke.startswith("$2a$") or hash_stocke.startswith("$2b$") or hash_stocke.startswith("$2y$"):
+            try:
+                if bcrypt.checkpw(mot_de_passe.encode("utf-8"), hash_stocke.encode("utf-8")):
+                    return jsonify({"utilisateur": u})
+            except ValueError:
+                pass
+            return jsonify({"erreur": "Identifiants invalides."}), 401
+
+        # Migration SHA-256 → bcrypt
+        if hash_stocke == hashlib.sha256(mot_de_passe.encode()).hexdigest():
+            nouveau_hash = bcrypt.hashpw(mot_de_passe.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+            try:
+                cell = ws.find(str(u.get("ID")), in_column=1)
+                if cell:
+                    entetes = ws.row_values(1)
+                    col = entetes.index("Mot_de_passe_hash") + 1 if "Mot_de_passe_hash" in entetes else 4
+                    ws.update_cell(cell.row, col, nouveau_hash)
+            except Exception:
+                pass
+            u["Mot_de_passe_hash"] = nouveau_hash
+            return jsonify({"utilisateur": u})
+
+        return jsonify({"erreur": "Identifiants invalides."}), 401
+
+    return jsonify({"erreur": "Identifiants invalides."}), 401
+
+
+# ── GET RECORDS ───────────────────────────────────────────────────────────────
 @app.route("/get_records", methods=["POST"])
 def get_records():
-    """Lit tous les enregistrements d'un onglet (équivalent get_all_records)."""
     sheet_id, erreur = _verifier_cle_api()
     if erreur:
         return erreur
@@ -148,13 +273,56 @@ def get_records():
     return jsonify({"records": records})
 
 
+# ── GET VALUES ──────────────────────────────────────────────────────────────
+@app.route("/get_values", methods=["POST"])
+def get_values():
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    onglet = corps.get("onglet")
+
+    if not onglet:
+        return jsonify({"erreur": "onglet requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(sheet_id)
+        ws = wb.worksheet(onglet)
+        valeurs = _appel_avec_retry(lambda: ws.get_all_values())
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible de lire l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
+
+    return jsonify({"valeurs": valeurs})
+
+
+# ── APPEND ROWS ───────────────────────────────────────────────────────────────
+@app.route("/append_rows", methods=["POST"])
+def append_rows():
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    onglet = corps.get("onglet")
+    lignes = corps.get("lignes")
+
+    if not onglet or not lignes:
+        return jsonify({"erreur": "onglet et lignes requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(sheet_id)
+        ws = wb.worksheet(onglet)
+        ws.append_rows(lignes, value_input_option="USER_ENTERED")
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible d'écrire dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
+
+    return jsonify({"status": "ok"})
+
+
+# ── MODIFIER LIGNE ──────────────────────────────────────────────────────────
 @app.route("/modifier_ligne", methods=["POST"])
 def modifier_ligne():
-    """
-    Trouve une ligne par une valeur dans une colonne donnée, et la remplace.
-    Note : colonne_debut est une lettre simple (A-Z) — suffisant tant
-    qu'aucun onglet migré n'a plus de 26 colonnes.
-    """
     sheet_id, erreur = _verifier_cle_api()
     if erreur:
         return erreur
@@ -175,7 +343,20 @@ def modifier_ligne():
         cell = ws.find(str(valeur_recherche), in_column=colonne_recherche)
         if not cell:
             return jsonify({"erreur": f"Ligne introuvable pour {valeur_recherche!r}."}), 404
-        colonne_fin = chr(ord(colonne_debut) + len(nouvelle_ligne) - 1)
+        
+        # Support colonnes au-delà de Z (AA, AB...)
+        def _col_name(index):
+            """Convertit un index 0-based en nom de colonne (A, B... Z, AA...)."""
+            name = ""
+            while index >= 0:
+                name = chr(index % 26 + ord('A')) + name
+                index = index // 26 - 1
+            return name
+        
+        start_idx = ord(colonne_debut.upper()) - ord('A')
+        end_idx = start_idx + len(nouvelle_ligne) - 1
+        colonne_fin = _col_name(end_idx)
+        
         ws.update(f"{colonne_debut}{cell.row}:{colonne_fin}{cell.row}", [nouvelle_ligne])
     except Exception as e:
         return jsonify({"erreur": f"Impossible de modifier l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
@@ -183,10 +364,9 @@ def modifier_ligne():
     return jsonify({"status": "ok"})
 
 
+# ── SUPPRIMER LIGNE ───────────────────────────────────────────────────────────
 @app.route("/supprimer_ligne", methods=["POST"])
 def supprimer_ligne():
-    """Trouve une ligne par une valeur dans une colonne donnée, et la supprime.
-    Silencieux si non trouvée (cohérent avec le comportement existant côté appli)."""
     sheet_id, erreur = _verifier_cle_api()
     if erreur:
         return erreur
@@ -210,22 +390,17 @@ def supprimer_ligne():
 
     return jsonify({"status": "ok"})
 
+
+# ── SUPPRIMER LIGNE CRITERES ─────────────────────────────────────────────────
 @app.route("/supprimer_ligne_criteres", methods=["POST"])
 def supprimer_ligne_criteres():
-    """
-    Trouve une ligne par PLUSIEURS critères combinés (liste de paires
-    colonne/valeur, toutes doivent correspondre) et la supprime. Utile
-    quand un seul critère (comme /supprimer_ligne) risquerait de
-    supprimer la mauvaise ligne — ex : EMPLOI_DU_TEMPS, où seul le
-    triplet Prof + Jour + Créneau est unique.
-    """
     sheet_id, erreur = _verifier_cle_api()
     if erreur:
         return erreur
 
     corps = request.get_json(silent=True) or {}
     onglet = corps.get("onglet")
-    criteres = corps.get("criteres")  # liste de {"colonne": int, "valeur": ...}
+    criteres = corps.get("criteres")
 
     if not onglet or not criteres:
         return jsonify({"erreur": "onglet et criteres requis."}), 400
@@ -235,7 +410,7 @@ def supprimer_ligne_criteres():
         ws = wb.worksheet(onglet)
         toutes_lignes = ws.get_all_values()
 
-        for i, ligne in enumerate(toutes_lignes[1:], start=2):  # ligne 1 = en-têtes
+        for i, ligne in enumerate(toutes_lignes[1:], start=2):
             match = True
             for c in criteres:
                 col = c["colonne"]
@@ -246,51 +421,40 @@ def supprimer_ligne_criteres():
             if match:
                 ws.delete_rows(i)
                 break
-        # Silencieux si non trouvée (cohérent avec /supprimer_ligne)
     except Exception as e:
         return jsonify({"erreur": f"Impossible de supprimer dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
     return jsonify({"status": "ok"})
 
 
+# ── MODIFIER CELLULE ────────────────────────────────────────────────────────
 @app.route("/modifier_cellule", methods=["POST"])
 def modifier_cellule():
-    """
-    Trouve une ligne par DEUX critères combinés (colonne_recherche_1 ==
-    valeur_recherche_1 ET colonne_recherche_2 == valeur_recherche_2), et met
-    à jour uniquement la cellule colonne_cible. Utile quand un seul critère
-    (comme dans /modifier_ligne) risquerait de matcher la mauvaise ligne
-    (ex : un élève avec plusieurs paiements dans ECOLAGE).
-    """
     sheet_id, erreur = _verifier_cle_api()
     if erreur:
         return erreur
 
     corps = request.get_json(silent=True) or {}
     onglet = corps.get("onglet")
-    colonne_recherche_1 = corps.get("colonne_recherche_1")
-    valeur_recherche_1 = corps.get("valeur_recherche_1")
-    colonne_recherche_2 = corps.get("colonne_recherche_2")
-    valeur_recherche_2 = corps.get("valeur_recherche_2")
+    c1 = corps.get("colonne_recherche_1")
+    v1 = corps.get("valeur_recherche_1")
+    c2 = corps.get("colonne_recherche_2")
+    v2 = corps.get("valeur_recherche_2")
     colonne_cible = corps.get("colonne_cible")
     nouvelle_valeur = corps.get("nouvelle_valeur")
 
-    if not onglet or None in (colonne_recherche_1, valeur_recherche_1,
-                               colonne_recherche_2, valeur_recherche_2,
-                               colonne_cible, nouvelle_valeur):
-        return jsonify({"erreur": "onglet, colonne_recherche_1/2, valeur_recherche_1/2, "
-                                   "colonne_cible et nouvelle_valeur requis."}), 400
+    if not onglet or None in (c1, v1, c2, v2, colonne_cible, nouvelle_valeur):
+        return jsonify({"erreur": "Tous les paramètres sont requis."}), 400
 
     try:
         wb = client_gspread().open_by_key(sheet_id)
         ws = wb.worksheet(onglet)
         toutes_lignes = ws.get_all_values()
 
-        for i, ligne in enumerate(toutes_lignes[1:], start=2):  # ligne 1 = en-têtes
-            val_1 = ligne[colonne_recherche_1 - 1] if len(ligne) >= colonne_recherche_1 else ""
-            val_2 = ligne[colonne_recherche_2 - 1] if len(ligne) >= colonne_recherche_2 else ""
-            if str(val_1).strip() == str(valeur_recherche_1).strip() and \
-               str(val_2).strip() == str(valeur_recherche_2).strip():
+        for i, ligne in enumerate(toutes_lignes[1:], start=2):
+            val_1 = ligne[c1 - 1] if len(ligne) >= c1 else ""
+            val_2 = ligne[c2 - 1] if len(ligne) >= c2 else ""
+            if str(val_1).strip() == str(v1).strip() and str(val_2).strip() == str(v2).strip():
                 ws.update_cell(i, colonne_cible, nouvelle_valeur)
                 return jsonify({"status": "ok"})
 
@@ -299,15 +463,9 @@ def modifier_cellule():
         return jsonify({"erreur": f"Impossible de modifier l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
 
+# ── REMPLACER LIGNES CLE ────────────────────────────────────────────────────
 @app.route("/remplacer_lignes_cle", methods=["POST"])
 def remplacer_lignes_cle():
-    """
-    Remplace, en UN seul aller-retour, toutes les lignes d'un onglet où
-    colonne_cle vaut valeur_cle par nouvelles_lignes (garde le reste de
-    l'onglet intact, garde la ligne d'en-têtes). Le filtrage + la
-    réécriture se font ici, côté serveur — évite au poste local de faire
-    un aller-retour par ligne à supprimer.
-    """
     sheet_id, erreur = _verifier_cle_api()
     if erreur:
         return erreur
@@ -338,48 +496,17 @@ def remplacer_lignes_cle():
             lignes_finales.extend(nouvelles_lignes)
 
         ws.clear()
-        ws.update("A1", lignes_finales)
+        if lignes_finales:
+            ws.update("A1", lignes_finales)
     except Exception as e:
         return jsonify({"erreur": f"Impossible de remplacer dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
     return jsonify({"status": "ok"})
 
-@app.route("/get_values", methods=["POST"])
-def get_values():
-    """Lit toutes les valeurs brutes (grille) d'un onglet — équivalent
-    get_all_values(). Utile pour les feuilles à structure libre (comme
-    CONFIGURATION, plusieurs blocs de colonnes côte à côte) que
-    get_records() (get_all_records, une seule table à en-têtes) ne peut
-    pas gérer."""
-    sheet_id, erreur = _verifier_cle_api()
-    if erreur:
-        return erreur
 
-    corps = request.get_json(silent=True) or {}
-    onglet = corps.get("onglet")
-
-    if not onglet:
-        return jsonify({"erreur": "onglet requis."}), 400
-
-    try:
-        wb = client_gspread().open_by_key(sheet_id)
-        ws = wb.worksheet(onglet)
-        valeurs = _appel_avec_retry(lambda: ws.get_all_values())
-    except Exception as e:
-        return jsonify({"erreur": f"Impossible de lire l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
-
-    return jsonify({"valeurs": valeurs})
-
-
+# ── ECRIRE CELLULE ──────────────────────────────────────────────────────────
 @app.route("/ecrire_cellule", methods=["POST"])
 def ecrire_cellule():
-    """
-    Écrit une valeur dans UNE cellule précise (ligne/colonne, sans recherche).
-    Utile pour insérer dans la première case libre d'une colonne dans un
-    onglet à structure libre (ex : CONFIGURATION — plusieurs blocs de
-    colonnes côte à côte, où le "prochain emplacement libre" est déterminé
-    côté appli à partir de /get_values, pas par une recherche de valeur).
-    """
     sheet_id, erreur = _verifier_cle_api()
     if erreur:
         return erreur
@@ -403,165 +530,9 @@ def ecrire_cellule():
     return jsonify({"status": "ok"})
 
 
-def registre_sheet_id():
-    """ID FIXE du classeur Registre (années scolaires) — un seul, partagé,
-    indépendant de la clé API de chaque établissement."""
-    sid = os.environ.get("REGISTRE_SHEET_ID")
-    if not sid:
-        raise RuntimeError("Variable d'environnement REGISTRE_SHEET_ID manquante.")
-    return sid
-
-
-NOM_ONGLET_ANNEES = "ANNEES"
-
-
-@app.route("/registre/annee_active", methods=["POST"])
-def registre_annee_active():
-    """Retourne la ligne (dict) de l'année marquée 'Active' dans le
-    registre, ou {"annee": None} si aucune."""
-    _, erreur = _verifier_cle_api()
-    if erreur:
-        return erreur
-
-    try:
-        wb = client_gspread().open_by_key(registre_sheet_id())
-        ws = wb.worksheet(NOM_ONGLET_ANNEES)
-        lignes = ws.get_all_records()
-    except Exception as e:
-        return jsonify({"erreur": f"Impossible de lire le registre : {type(e).__name__} - {e}"}), 502
-
-    for ligne in lignes:
-        if ligne.get("Statut") == "Active":
-            return jsonify({"annee": ligne})
-    return jsonify({"annee": None})
-
-
-@app.route("/registre/enregistrer_nouvelle_annee", methods=["POST"])
-def registre_enregistrer_nouvelle_annee():
-    """Ajoute une nouvelle ligne 'Active' dans le registre — appelé à la
-    clôture d'année, juste après la création du nouveau classeur."""
-    _, erreur = _verifier_cle_api()
-    if erreur:
-        return erreur
-
-    corps = request.get_json(silent=True) or {}
-    annee = corps.get("annee")
-    spreadsheet_id = corps.get("spreadsheet_id")
-    if not annee or not spreadsheet_id:
-        return jsonify({"erreur": "annee et spreadsheet_id requis."}), 400
-
-    try:
-        wb = client_gspread().open_by_key(registre_sheet_id())
-        ws = wb.worksheet(NOM_ONGLET_ANNEES)
-        ws.append_row([annee, spreadsheet_id, "Active", ""])
-    except Exception as e:
-        return jsonify({"erreur": f"Impossible d'écrire dans le registre : {type(e).__name__} - {e}"}), 502
-
-    return jsonify({"status": "ok"})
-
-
-@app.route("/registre/archiver_annee", methods=["POST"])
-def registre_archiver_annee():
-    """Passe une année de 'Active' à 'Archivée', avec la date du jour."""
-    _, erreur = _verifier_cle_api()
-    if erreur:
-        return erreur
-
-    corps = request.get_json(silent=True) or {}
-    annee = corps.get("annee")
-    if not annee:
-        return jsonify({"erreur": "annee requis."}), 400
-
-    try:
-        wb = client_gspread().open_by_key(registre_sheet_id())
-        ws = wb.worksheet(NOM_ONGLET_ANNEES)
-        cell = ws.find(annee)
-        if not cell:
-            return jsonify({"erreur": f"Année introuvable dans le registre : {annee}"}), 404
-        ws.update_cell(cell.row, 3, "Archivée")
-        ws.update_cell(cell.row, 4, date.today().strftime("%d/%m/%Y"))
-    except Exception as e:
-        return jsonify({"erreur": f"Impossible d'archiver dans le registre : {type(e).__name__} - {e}"}), 502
-
-    return jsonify({"status": "ok"})
-
-
-@app.route("/verifier_connexion", methods=["POST"])
-def verifier_connexion():
-    sheet_id, erreur = _verifier_cle_api()
-    if erreur:
-        return erreur
-
-    corps = request.get_json(silent=True) or {}
-    email = (corps.get("email") or "").strip()
-    mot_de_passe = corps.get("mot_de_passe") or ""
-
-    if not email or not mot_de_passe:
-        return jsonify({"erreur": "email et mot_de_passe requis."}), 400
-
-    try:
-        wb = client_gspread().open_by_key(sheet_id)
-        ws = wb.worksheet("UTILISATEURS")
-        utilisateurs = ws.get_all_records()
-    except gspread.exceptions.APIError as e:
-        detail = getattr(e.response, "text", str(e))
-        return jsonify({"erreur": f"Erreur API Google ({e.response.status_code}) sur sheet_id={sheet_id!r} : {detail[:500]}"}), 502
-    except gspread.exceptions.SpreadsheetNotFound as e:
-        # SpreadsheetNotFound cache la vraie réponse HTTP de Google dans ses
-        # arguments — on va la chercher pour voir le message réel au lieu
-        # du résumé générique "<Response [404]>".
-        reponse_brute = e.args[0] if e.args else None
-        detail = getattr(reponse_brute, "text", str(e))
-        return jsonify({"erreur": f"SpreadsheetNotFound sur sheet_id={sheet_id!r} — détail Google : {detail[:500]}"}), 502
-    except gspread.exceptions.WorksheetNotFound:
-        return jsonify({"erreur": f"Onglet 'UTILISATEURS' introuvable dans le classeur sheet_id={sheet_id!r}."}), 502
-    except Exception as e:
-        return jsonify({"erreur": f"Impossible de lire le classeur (sheet_id={sheet_id!r}) : {type(e).__name__} - {e}"}), 502
-
-    for u in utilisateurs:
-        if u.get("Email", "").lower() != email.lower() or u.get("Actif", "") != "OUI":
-            continue
-
-        hash_stocke = u.get("Mot_de_passe_hash", "")
-
-        if hash_stocke.startswith("$2a$") or hash_stocke.startswith("$2b$") or hash_stocke.startswith("$2y$"):
-            try:
-                if bcrypt.checkpw(mot_de_passe.encode("utf-8"), hash_stocke.encode("utf-8")):
-                    return jsonify({"utilisateur": u})
-            except ValueError:
-                pass
-            return jsonify({"erreur": "Identifiants invalides."}), 401
-
-        # Ancien format SHA-256 : vérifié une dernière fois, puis migré en bcrypt
-        if hash_stocke == hashlib.sha256(mot_de_passe.encode()).hexdigest():
-            nouveau_hash = bcrypt.hashpw(mot_de_passe.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-            try:
-                cell = ws.find(str(u.get("ID")), in_column=1)
-                if cell:
-                    entetes = ws.row_values(1)
-                    col = entetes.index("Mot_de_passe_hash") + 1 if "Mot_de_passe_hash" in entetes else 4
-                    ws.update_cell(cell.row, col, nouveau_hash)
-            except Exception:
-                pass  # migration best-effort, ne bloque jamais la connexion
-            u["Mot_de_passe_hash"] = nouveau_hash
-            return jsonify({"utilisateur": u})
-
-        return jsonify({"erreur": "Identifiants invalides."}), 401
-
-    return jsonify({"erreur": "Identifiants invalides."}), 401
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
+# ── ECRIRE PARAM CONFIG ─────────────────────────────────────────────────────
 @app.route("/ecrire_param_config", methods=["POST"])
 def ecrire_param_config():
-    """
-    Upsert clé/valeur dans un onglet type CONFIGURATION : cherche une
-    ligne où colonne_cle == cle ; si trouvée, met à jour colonne_valeur ;
-    sinon cherche la première ligne (à partir de ligne_depart) où
-    colonne_cle est vide et l'utilise ; sinon ajoute une nouvelle ligne.
-    """
     sheet_id, erreur = _verifier_cle_api()
     if erreur:
         return erreur
@@ -575,7 +546,7 @@ def ecrire_param_config():
     ligne_depart = corps.get("ligne_depart", 1)
 
     if not onglet or colonne_cle is None or colonne_valeur is None or cle is None or valeur is None:
-        return jsonify({"erreur": "onglet, colonne_cle, colonne_valeur, cle et valeur requis."}), 400
+        return jsonify({"erreur": "Paramètres incomplets."}), 400
 
     try:
         wb = client_gspread().open_by_key(sheet_id)
@@ -602,11 +573,9 @@ def ecrire_param_config():
         return jsonify({"erreur": f"Impossible d'écrire dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
 
+# ── VIDER PARAMS PREFIXE ────────────────────────────────────────────────────
 @app.route("/vider_params_prefixe", methods=["POST"])
 def vider_params_prefixe():
-    """Vide (met à '') colonne_cle et colonne_valeur pour toutes les lignes
-    où colonne_cle commence par un préfixe donné — sert à réinitialiser un
-    groupe de clés (ex : toutes les MENTION_xx) avant de les réécrire."""
     sheet_id, erreur = _verifier_cle_api()
     if erreur:
         return erreur
@@ -618,7 +587,7 @@ def vider_params_prefixe():
     prefixe = corps.get("prefixe")
 
     if not onglet or colonne_cle is None or colonne_valeur is None or not prefixe:
-        return jsonify({"erreur": "onglet, colonne_cle, colonne_valeur et prefixe requis."}), 400
+        return jsonify({"erreur": "Paramètres incomplets."}), 400
 
     try:
         wb = client_gspread().open_by_key(sheet_id)
@@ -632,14 +601,10 @@ def vider_params_prefixe():
     except Exception as e:
         return jsonify({"erreur": f"Impossible de vider dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
+
+# ── REMPLACER ONGLET ──────────────────────────────────────────────────────────
 @app.route("/remplacer_onglet", methods=["POST"])
 def remplacer_onglet():
-    """
-    Remplace tout le contenu d'un onglet (vide + réécrit) en un seul
-    aller-retour, en le créant s'il n'existe pas encore. Utilisé pour les
-    grilles complètes (ex : TARIFS_ECOLAGE) recalculées en entier côté
-    appli à chaque sauvegarde.
-    """
     sheet_id, erreur = _verifier_cle_api()
     if erreur:
         return erreur
@@ -665,13 +630,10 @@ def remplacer_onglet():
     except Exception as e:
         return jsonify({"erreur": f"Impossible de remplacer l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
+
+# ── COLORER CELLULE ─────────────────────────────────────────────────────────
 @app.route("/colorer_cellule", methods=["POST"])
 def colorer_cellule():
-    """
-    Cherche une ligne par une valeur de clé (colonne_recherche/valeur_recherche)
-    et applique une couleur de fond à une cellule cible de cette ligne.
-    Utilisé pour le statut vert/rouge des préinscriptions validées/rejetées.
-    """
     sheet_id, erreur = _verifier_cle_api()
     if erreur:
         return erreur
@@ -681,10 +643,10 @@ def colorer_cellule():
     colonne_recherche = corps.get("colonne_recherche")
     valeur_recherche = corps.get("valeur_recherche")
     colonne_cible = corps.get("colonne_cible")
-    couleur = corps.get("couleur", "")  # "vert" | "rouge" | ""
+    couleur = corps.get("couleur", "")
 
     if not onglet or colonne_recherche is None or valeur_recherche is None or colonne_cible is None:
-        return jsonify({"erreur": "onglet, colonne_recherche, valeur_recherche et colonne_cible requis."}), 400
+        return jsonify({"erreur": "Paramètres incomplets."}), 400
 
     couleurs = {
         "vert":  {"red": 0.80, "green": 0.94, "blue": 0.80},
@@ -708,3 +670,79 @@ def colorer_cellule():
         return jsonify({"erreur": f"Ligne introuvable pour {valeur_recherche!r}."}), 404
     except Exception as e:
         return jsonify({"erreur": f"Impossible de colorer dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
+
+
+# ── REGISTRE : ANNEE ACTIVE ─────────────────────────────────────────────────
+@app.route("/registre/annee_active", methods=["POST"])
+def registre_annee_active():
+    _, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    try:
+        wb = client_gspread().open_by_key(registre_sheet_id())
+        ws = wb.worksheet("ANNEES")
+        lignes = ws.get_all_records()
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible de lire le registre : {type(e).__name__} - {e}"}), 502
+
+    for ligne in lignes:
+        if ligne.get("Statut") == "Active":
+            return jsonify({"annee": ligne})
+    return jsonify({"annee": None})
+
+
+# ── REGISTRE : ENREGISTRER NOUVELLE ANNEE ───────────────────────────────────
+@app.route("/registre/enregistrer_nouvelle_annee", methods=["POST"])
+def registre_enregistrer_nouvelle_annee():
+    _, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    annee = corps.get("annee")
+    spreadsheet_id = corps.get("spreadsheet_id")
+    if not annee or not spreadsheet_id:
+        return jsonify({"erreur": "annee et spreadsheet_id requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(registre_sheet_id())
+        ws = wb.worksheet("ANNEES")
+        ws.append_row([annee, spreadsheet_id, "Active", ""])
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible d'écrire dans le registre : {type(e).__name__} - {e}"}), 502
+
+    return jsonify({"status": "ok"})
+
+
+# ── REGISTRE : ARCHIVER ANNEE ───────────────────────────────────────────────
+@app.route("/registre/archiver_annee", methods=["POST"])
+def registre_archiver_annee():
+    _, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    annee = corps.get("annee")
+    if not annee:
+        return jsonify({"erreur": "annee requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(registre_sheet_id())
+        ws = wb.worksheet("ANNEES")
+        cell = ws.find(annee)
+        if not cell:
+            return jsonify({"erreur": f"Année introuvable dans le registre : {annee}"}), 404
+        ws.update_cell(cell.row, 3, "Archivée")
+        ws.update_cell(cell.row, 4, date.today().strftime("%d/%m/%Y"))
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible d'archiver dans le registre : {type(e).__name__} - {e}"}), 502
+
+    return jsonify({"status": "ok"})
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  POINT D'ENTREE
+# ═════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
