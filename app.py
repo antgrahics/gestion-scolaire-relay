@@ -118,16 +118,20 @@ def _verifier_cle_api():
 
 
 # ── UTILITAIRES ─────────────────────────────────────────────────────────────
-def _appel_avec_retry(fonction, tentatives=2, delai=3):
+def _appel_avec_retry(fonction, tentatives=4, delai_initial=2):
+    """Retry avec backoff exponentiel pour les erreurs 429 (quota Google)."""
     derniere_erreur = None
     for tentative in range(tentatives):
         try:
             return fonction()
         except Exception as e:
             derniere_erreur = e
-            if "429" in str(e) or "Quota exceeded" in str(e):
+            msg = str(e)
+            if "429" in msg or "Quota exceeded" in msg or "Rate limit" in msg:
                 if tentative < tentatives - 1:
-                    time.sleep(delai)
+                    pause = delai_initial * (2 ** tentative)  # 2s, 4s, 8s...
+                    print(f"[Retry {tentative+1}/{tentatives}] Quota dépassé, attente {pause}s...")
+                    time.sleep(pause)
                     continue
             raise
     raise derniere_erreur
