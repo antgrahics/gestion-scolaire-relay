@@ -1,5 +1,5 @@
 """
-app.py — Relais gestion_scolaire (CORRIGE)
+app.py — Relais gestion_scolaire (VERSION CLIENTS WEB)
 
 Variables d'environnement Render :
   - GOOGLE_CREDENTIALS_JSON : contenu JSON du compte de service
@@ -15,13 +15,23 @@ import hashlib
 import secrets
 from datetime import date, datetime
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import gspread
 from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
 
+# ── CORS : autorise les apps web à appeler le relais ───────────────────────
+CORS(app, origins=[
+    "https://app-notes.onrender.com",
+    "https://portail-parent.onrender.com",
+    "http://localhost:5000",
+    "http://localhost:5001",
+    "http://127.0.0.1:5000",
+    "http://127.0.0.1:5001",
+])
+
 # ── SCOPES ───────────────────────────────────────────────────────────────────
-# Drive est inclus pour les futures opérations (clôture d'année, copie classeur)
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -35,7 +45,7 @@ def _clean_env_json(raw: str) -> str:
     """Nettoie les échappements de Render (guillemets et \n échappés)."""
     raw = raw.strip()
     if raw.startswith('"') and raw.endswith('"'):
-        raw = raw[1:-1].replace('\\n', '\n').replace('\\"', '"')
+        raw = raw[1:-1].replace(r'\n', '\n').replace(r'\"', '"')
     return raw
 
 
@@ -55,7 +65,6 @@ def client_gspread():
     return _client_gspread
 
 
-# ── REGISTRE ─────────────────────────────────────────────────────────────────
 def registre_sheet_id():
     sid = os.environ.get("REGISTRE_SHEET_ID")
     if not sid:
@@ -64,7 +73,6 @@ def registre_sheet_id():
 
 
 # ── ETABLISSEMENTS (mapping clé API → Sheet_ID) ──────────────────────────────
-# Cache mémoire avec TTL (5 min) pour ne pas taper Google à chaque requête
 _cache_etablissements = {"data": {}, "expires": 0}
 
 
@@ -72,20 +80,17 @@ def _charger_etablissements():
     """Charge le mapping depuis ETABLISSEMENTS_JSON (env) ou le Registre Sheets."""
     global _cache_etablissements
     maintenant = time.time()
-    
+
     if maintenant < _cache_etablissements["expires"]:
         return _cache_etablissements["data"]
 
     mapping = {}
-
-    # 1. Fallback variable d'environnement (rapide, tests)
     brut = os.environ.get("ETABLISSEMENTS_JSON", "{}")
     try:
         mapping.update(json.loads(_clean_env_json(brut)))
     except json.JSONDecodeError:
         pass
 
-    # 2. Source principale : onglet ETABLISSEMENTS dans le Registre
     try:
         wb = client_gspread().open_by_key(registre_sheet_id())
         try:
@@ -96,7 +101,7 @@ def _charger_etablissements():
                 if cle and sid:
                     mapping[cle] = sid
         except gspread.exceptions.WorksheetNotFound:
-            pass  # pas encore créé, pas grave
+            pass
     except Exception as e:
         print(f"[WARN] Impossible de lire le Registre ETABLISSEMENTS : {e}")
 
@@ -117,14 +122,9 @@ def _verifier_cle_api():
     return sheet_id, None
 
 
-# ── CACHE DE LECTURE (get_records / get_values) ──────────────────────────────
-# Chaque onglet lu est gardé 20s en mémoire. Sans ça, chaque poste qui
-# démarre (charger_tout() lit ~12 onglets) tape Google à chaque fois, même
-# si un autre poste vient de lire exactement le même onglet une seconde
-# avant — c'est ça qui fait sauter le quota "Read requests per minute per
-# user" quand plusieurs postes se lancent au même moment (le matin, typiquement).
+# ── CACHE DE LECTURE ────────────────────────────────────────────────────────
 _cache_lectures = {}
-_DUREE_CACHE_LECTURE = 20  # secondes
+_DUREE_CACHE_LECTURE = 20
 
 
 def _cle_cache_lecture(sheet_id, onglet, suffixe=""):
@@ -142,16 +142,12 @@ def _lire_avec_cache(cle, fonction_lecture):
 
 
 def _invalider_cache_onglet(sheet_id, onglet):
-    """À appeler après toute écriture réussie sur cet onglet, pour ne pas
-    resservir de données périmées depuis le cache de lecture."""
     for cle in list(_cache_lectures.keys()):
         if cle[0] == sheet_id and cle[1] == onglet:
             _cache_lectures.pop(cle, None)
 
 
-# ── UTILITAIRES ─────────────────────────────────────────────────────────────
 def _appel_avec_retry(fonction, tentatives=4, delai_initial=2):
-    """Retry avec backoff exponentiel pour les erreurs 429 (quota Google)."""
     derniere_erreur = None
     for tentative in range(tentatives):
         try:
@@ -161,7 +157,7 @@ def _appel_avec_retry(fonction, tentatives=4, delai_initial=2):
             msg = str(e)
             if "429" in msg or "Quota exceeded" in msg or "Rate limit" in msg:
                 if tentative < tentatives - 1:
-                    pause = delai_initial * (2 ** tentative)  # 2s, 4s, 8s...
+                    pause = delai_initial * (2 ** tentative)
                     print(f"[Retry {tentative+1}/{tentatives}] Quota dépassé, attente {pause}s...")
                     time.sleep(pause)
                     continue
@@ -178,14 +174,8 @@ def health():
     return jsonify({"status": "ok"})
 
 
-# ── ENREGISTREMENT D'UN NOUVEL ETABLISSEMENT ────────────────────────────────
 @app.route("/enregistrer_etablissement", methods=["POST"])
 def enregistrer_etablissement():
-    """
-    Appelé par le desktop au moment du setup initial.
-    Génère une clé API, l'enregistre dans le Registre (onglet ETABLISSEMENTS),
-    et retourne la clé au client pour qu'il la sauvegarde localement.
-    """
     corps = request.get_json(silent=True) or {}
     nom = corps.get("nom_etablissement", "").strip()
     sheet_id = corps.get("sheet_id", "").strip()
@@ -194,14 +184,11 @@ def enregistrer_etablissement():
     if not nom or not sheet_id:
         return jsonify({"erreur": "nom_etablissement et sheet_id requis."}), 400
 
-    # Génère une clé API sécurisée
     cle_api = f"AG-{int(time.time())}-{secrets.token_hex(8).upper()}"
 
     try:
-        # Utilise le registre fourni ou celui de l'env
         rid = registre_id or registre_sheet_id()
         wb = client_gspread().open_by_key(rid)
-        
         try:
             ws = wb.worksheet("ETABLISSEMENTS")
         except gspread.exceptions.WorksheetNotFound:
@@ -209,22 +196,17 @@ def enregistrer_etablissement():
             ws.append_row(["Cle_API", "Sheet_ID", "Nom_Etablissement", "Date_Creation"])
 
         ws.append_row([
-            cle_api,
-            sheet_id,
-            nom,
+            cle_api, sheet_id, nom,
             datetime.now().strftime("%d/%m/%Y %H:%M")
         ])
-        
-        # Invalide le cache mémoire pour forcer le rechargement
         _cache_etablissements["expires"] = 0
-        
     except Exception as e:
         return jsonify({"erreur": f"Impossible d'écrire dans le registre : {type(e).__name__} - {e}"}), 502
 
     return jsonify({"cle_api": cle_api, "sheet_id": sheet_id}), 200
 
 
-# ── VERIFIER CONNEXION ──────────────────────────────────────────────────────
+# ── VERIFIER CONNEXION (Professeurs) ────────────────────────────────────────
 @app.route("/verifier_connexion", methods=["POST"])
 def verifier_connexion():
     sheet_id, erreur = _verifier_cle_api()
@@ -242,11 +224,6 @@ def verifier_connexion():
         wb = client_gspread().open_by_key(sheet_id)
         ws = wb.worksheet("UTILISATEURS")
         utilisateurs = ws.get_all_records()
-    except gspread.exceptions.APIError as e:
-        detail = getattr(e.response, "text", str(e))
-        return jsonify({"erreur": f"Erreur API Google : {detail[:500]}"}), 502
-    except gspread.exceptions.SpreadsheetNotFound:
-        return jsonify({"erreur": "Classeur introuvable."}), 502
     except gspread.exceptions.WorksheetNotFound:
         return jsonify({"erreur": "Onglet UTILISATEURS introuvable."}), 502
     except Exception as e:
@@ -258,7 +235,7 @@ def verifier_connexion():
 
         hash_stocke = u.get("Mot_de_passe_hash", "")
 
-        if hash_stocke.startswith("$2a$") or hash_stocke.startswith("$2b$") or hash_stocke.startswith("$2y$"):
+        if hash_stocke.startswith(("$2a$", "$2b$", "$2y$")):
             try:
                 if bcrypt.checkpw(mot_de_passe.encode("utf-8"), hash_stocke.encode("utf-8")):
                     return jsonify({"utilisateur": u})
@@ -266,7 +243,6 @@ def verifier_connexion():
                 pass
             return jsonify({"erreur": "Identifiants invalides."}), 401
 
-        # Migration SHA-256 → bcrypt
         if hash_stocke == hashlib.sha256(mot_de_passe.encode()).hexdigest():
             nouveau_hash = bcrypt.hashpw(mot_de_passe.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
             try:
@@ -283,6 +259,41 @@ def verifier_connexion():
         return jsonify({"erreur": "Identifiants invalides."}), 401
 
     return jsonify({"erreur": "Identifiants invalides."}), 401
+
+
+# ── VERIFIER PARENT (NOUVEAU) ───────────────────────────────────────────────
+@app.route("/verifier_parent", methods=["POST"])
+def verifier_parent():
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    telephone = (corps.get("telephone") or "").strip().replace(" ", "")
+    code = (corps.get("code") or "").strip()
+
+    if not telephone or not code:
+        return jsonify({"erreur": "telephone et code requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(sheet_id)
+        ws = wb.worksheet("PARENTS")
+        parents = ws.get_all_values()
+    except gspread.exceptions.WorksheetNotFound:
+        return jsonify({"erreur": "Onglet PARENTS introuvable."}), 502
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible de lire le classeur : {type(e).__name__} - {e}"}), 502
+
+    for row in parents[3:]:
+        if len(row) >= 2:
+            tel = row[0].strip().replace(" ", "")
+            code_stocke = row[1].strip()
+            if tel == telephone and code_stocke == code:
+                ids = [x.strip() for x in row[2].replace(";", ",").split(",") if x.strip()]
+                statut = row[3].strip() if len(row) > 3 else "Actif"
+                return jsonify({"valide": True, "id_eleves": ids, "statut": statut})
+
+    return jsonify({"erreur": "Code ou téléphone incorrect."}), 401
 
 
 # ── GET RECORDS ───────────────────────────────────────────────────────────────
@@ -382,20 +393,18 @@ def modifier_ligne():
         cell = ws.find(str(valeur_recherche), in_column=colonne_recherche)
         if not cell:
             return jsonify({"erreur": f"Ligne introuvable pour {valeur_recherche!r}."}), 404
-        
-        # Support colonnes au-delà de Z (AA, AB...)
+
         def _col_name(index):
-            """Convertit un index 0-based en nom de colonne (A, B... Z, AA...)."""
             name = ""
             while index >= 0:
                 name = chr(index % 26 + ord('A')) + name
                 index = index // 26 - 1
             return name
-        
+
         start_idx = ord(colonne_debut.upper()) - ord('A')
         end_idx = start_idx + len(nouvelle_ligne) - 1
         colonne_fin = _col_name(end_idx)
-        
+
         ws.update(f"{colonne_debut}{cell.row}:{colonne_fin}{cell.row}", [nouvelle_ligne])
         _invalider_cache_onglet(sheet_id, onglet)
     except Exception as e:
@@ -472,12 +481,6 @@ def supprimer_ligne_criteres():
 # ── SUPPRIMER LIGNES PLAGE ───────────────────────────────────────────────────
 @app.route("/supprimer_lignes_plage", methods=["POST"])
 def supprimer_lignes_plage():
-    """Supprime, en un seul aller-retour, toutes les lignes de `debut` à
-    `fin` (inclus, 1-based) sur un onglet — utilisé par l'upsert des notes
-    (NotesView) pour retirer les anciennes lignes avant de réinsérer les
-    nouvelles. Manquait au relais alors que le client desktop l'appelait
-    déjà : chaque appel levait AttributeError, l'ancienne ligne n'était
-    jamais supprimée et une nouvelle ligne s'ajoutait par-dessus -> doublons."""
     sheet_id, erreur = _verifier_cle_api()
     if erreur:
         return erreur
