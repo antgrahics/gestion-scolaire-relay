@@ -117,6 +117,38 @@ def _verifier_cle_api():
     return sheet_id, None
 
 
+# ── CACHE DE LECTURE (get_records / get_values) ──────────────────────────────
+# Chaque onglet lu est gardé 20s en mémoire. Sans ça, chaque poste qui
+# démarre (charger_tout() lit ~12 onglets) tape Google à chaque fois, même
+# si un autre poste vient de lire exactement le même onglet une seconde
+# avant — c'est ça qui fait sauter le quota "Read requests per minute per
+# user" quand plusieurs postes se lancent au même moment (le matin, typiquement).
+_cache_lectures = {}
+_DUREE_CACHE_LECTURE = 20  # secondes
+
+
+def _cle_cache_lecture(sheet_id, onglet, suffixe=""):
+    return (sheet_id, onglet, suffixe)
+
+
+def _lire_avec_cache(cle, fonction_lecture):
+    maintenant = time.time()
+    entree = _cache_lectures.get(cle)
+    if entree and maintenant < entree["expires"]:
+        return entree["data"]
+    data = _appel_avec_retry(fonction_lecture)
+    _cache_lectures[cle] = {"data": data, "expires": maintenant + _DUREE_CACHE_LECTURE}
+    return data
+
+
+def _invalider_cache_onglet(sheet_id, onglet):
+    """À appeler après toute écriture réussie sur cet onglet, pour ne pas
+    resservir de données périmées depuis le cache de lecture."""
+    for cle in list(_cache_lectures.keys()):
+        if cle[0] == sheet_id and cle[1] == onglet:
+            _cache_lectures.pop(cle, None)
+
+
 # ── UTILITAIRES ─────────────────────────────────────────────────────────────
 def _appel_avec_retry(fonction, tentatives=4, delai_initial=2):
     """Retry avec backoff exponentiel pour les erreurs 429 (quota Google)."""
@@ -268,9 +300,10 @@ def get_records():
         return jsonify({"erreur": "onglet requis."}), 400
 
     try:
-        wb = client_gspread().open_by_key(sheet_id)
-        ws = wb.worksheet(onglet)
-        records = _appel_avec_retry(lambda: ws.get_all_records(head=head))
+        records = _lire_avec_cache(
+            _cle_cache_lecture(sheet_id, onglet, f"records:{head}"),
+            lambda: client_gspread().open_by_key(sheet_id).worksheet(onglet).get_all_records(head=head)
+        )
     except Exception as e:
         return jsonify({"erreur": f"Impossible de lire l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
@@ -291,9 +324,10 @@ def get_values():
         return jsonify({"erreur": "onglet requis."}), 400
 
     try:
-        wb = client_gspread().open_by_key(sheet_id)
-        ws = wb.worksheet(onglet)
-        valeurs = _appel_avec_retry(lambda: ws.get_all_values())
+        valeurs = _lire_avec_cache(
+            _cle_cache_lecture(sheet_id, onglet, "values"),
+            lambda: client_gspread().open_by_key(sheet_id).worksheet(onglet).get_all_values()
+        )
     except Exception as e:
         return jsonify({"erreur": f"Impossible de lire l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
@@ -318,6 +352,7 @@ def append_rows():
         wb = client_gspread().open_by_key(sheet_id)
         ws = wb.worksheet(onglet)
         ws.append_rows(lignes, value_input_option="USER_ENTERED")
+        _invalider_cache_onglet(sheet_id, onglet)
     except Exception as e:
         return jsonify({"erreur": f"Impossible d'écrire dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
@@ -362,6 +397,7 @@ def modifier_ligne():
         colonne_fin = _col_name(end_idx)
         
         ws.update(f"{colonne_debut}{cell.row}:{colonne_fin}{cell.row}", [nouvelle_ligne])
+        _invalider_cache_onglet(sheet_id, onglet)
     except Exception as e:
         return jsonify({"erreur": f"Impossible de modifier l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
@@ -389,6 +425,7 @@ def supprimer_ligne():
         cell = ws.find(str(valeur_recherche), in_column=colonne_recherche)
         if cell:
             ws.delete_rows(cell.row)
+            _invalider_cache_onglet(sheet_id, onglet)
     except Exception as e:
         return jsonify({"erreur": f"Impossible de supprimer dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
@@ -424,9 +461,42 @@ def supprimer_ligne_criteres():
                     break
             if match:
                 ws.delete_rows(i)
+                _invalider_cache_onglet(sheet_id, onglet)
                 break
     except Exception as e:
         return jsonify({"erreur": f"Impossible de supprimer dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
+
+    return jsonify({"status": "ok"})
+
+
+# ── SUPPRIMER LIGNES PLAGE ───────────────────────────────────────────────────
+@app.route("/supprimer_lignes_plage", methods=["POST"])
+def supprimer_lignes_plage():
+    """Supprime, en un seul aller-retour, toutes les lignes de `debut` à
+    `fin` (inclus, 1-based) sur un onglet — utilisé par l'upsert des notes
+    (NotesView) pour retirer les anciennes lignes avant de réinsérer les
+    nouvelles. Manquait au relais alors que le client desktop l'appelait
+    déjà : chaque appel levait AttributeError, l'ancienne ligne n'était
+    jamais supprimée et une nouvelle ligne s'ajoutait par-dessus -> doublons."""
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    onglet = corps.get("onglet")
+    debut = corps.get("debut")
+    fin = corps.get("fin")
+
+    if not onglet or debut is None or fin is None:
+        return jsonify({"erreur": "onglet, debut et fin requis."}), 400
+
+    try:
+        wb = client_gspread().open_by_key(sheet_id)
+        ws = wb.worksheet(onglet)
+        _appel_avec_retry(lambda: ws.delete_rows(debut, fin))
+        _invalider_cache_onglet(sheet_id, onglet)
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible de supprimer les lignes {debut}-{fin} de l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
     return jsonify({"status": "ok"})
 
@@ -460,6 +530,7 @@ def modifier_cellule():
             val_2 = ligne[c2 - 1] if len(ligne) >= c2 else ""
             if str(val_1).strip() == str(v1).strip() and str(val_2).strip() == str(v2).strip():
                 ws.update_cell(i, colonne_cible, nouvelle_valeur)
+                _invalider_cache_onglet(sheet_id, onglet)
                 return jsonify({"status": "ok"})
 
         return jsonify({"erreur": "Ligne introuvable pour ces critères."}), 404
@@ -502,6 +573,7 @@ def remplacer_lignes_cle():
         ws.clear()
         if lignes_finales:
             ws.update("A1", lignes_finales)
+        _invalider_cache_onglet(sheet_id, onglet)
     except Exception as e:
         return jsonify({"erreur": f"Impossible de remplacer dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
@@ -528,6 +600,7 @@ def ecrire_cellule():
         wb = client_gspread().open_by_key(sheet_id)
         ws = wb.worksheet(onglet)
         ws.update_cell(ligne, colonne, valeur)
+        _invalider_cache_onglet(sheet_id, onglet)
     except Exception as e:
         return jsonify({"erreur": f"Impossible d'écrire dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
@@ -560,6 +633,7 @@ def ecrire_param_config():
         for i, row in enumerate(data, start=1):
             if len(row) >= colonne_cle and str(row[colonne_cle - 1]).strip().upper() == str(cle).upper():
                 ws.update_cell(i, colonne_valeur, valeur)
+                _invalider_cache_onglet(sheet_id, onglet)
                 return jsonify({"status": "ok"})
 
         for i, row in enumerate(data[ligne_depart - 1:], start=ligne_depart):
@@ -567,11 +641,13 @@ def ecrire_param_config():
             if vide:
                 ws.update_cell(i, colonne_cle, str(cle).upper())
                 ws.update_cell(i, colonne_valeur, valeur)
+                _invalider_cache_onglet(sheet_id, onglet)
                 return jsonify({"status": "ok"})
 
         nouvelle_ligne = len(data) + 1
         ws.update_cell(nouvelle_ligne, colonne_cle, str(cle).upper())
         ws.update_cell(nouvelle_ligne, colonne_valeur, valeur)
+        _invalider_cache_onglet(sheet_id, onglet)
         return jsonify({"status": "ok"})
     except Exception as e:
         return jsonify({"erreur": f"Impossible d'écrire dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
@@ -601,6 +677,7 @@ def vider_params_prefixe():
             if len(row) >= colonne_cle and str(row[colonne_cle - 1]).strip().upper().startswith(prefixe.upper()):
                 ws.update_cell(i, colonne_cle, "")
                 ws.update_cell(i, colonne_valeur, "")
+        _invalider_cache_onglet(sheet_id, onglet)
         return jsonify({"status": "ok"})
     except Exception as e:
         return jsonify({"erreur": f"Impossible de vider dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
@@ -630,6 +707,7 @@ def remplacer_onglet():
         ws.clear()
         if lignes:
             ws.update("A1", lignes)
+        _invalider_cache_onglet(sheet_id, onglet)
         return jsonify({"status": "ok"})
     except Exception as e:
         return jsonify({"erreur": f"Impossible de remplacer l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
