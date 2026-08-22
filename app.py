@@ -24,7 +24,7 @@ app = Flask(__name__)
 # ── CORS : autorise les apps web à appeler le relais ───────────────────────
 CORS(app, origins=[
     "https://app-notes.onrender.com",
-    "https://portail-parent.onrender.com",
+    "https://portail-parents.onrender.com",
     "http://localhost:5000",
     "http://localhost:5001",
     "http://127.0.0.1:5000",
