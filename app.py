@@ -23,7 +23,7 @@ app = Flask(__name__)
 
 # ── CORS : autorise les apps web à appeler le relais ───────────────────────
 CORS(app, origins=[
-    "https://app-notes.onrender.com",
+    "https://gestion-notes-ecole.onrender.com",
     "https://portail-parents.onrender.com",
     "http://localhost:5000",
     "http://localhost:5001",
@@ -76,8 +76,12 @@ def registre_sheet_id():
 _cache_etablissements = {"data": {}, "expires": 0}
 
 
+# ── ETABLISSEMENTS (mapping clé API → Sheet_ID, et code → clé API) ──────────
+_cache_etablissements = {"data": {}, "codes": {}, "expires": 0}
+
+
 def _charger_etablissements():
-    """Charge le mapping depuis ETABLISSEMENTS_JSON (env) ou le Registre Sheets."""
+    """Charge les mappings depuis ETABLISSEMENTS_JSON (env) ou le Registre Sheets."""
     global _cache_etablissements
     maintenant = time.time()
 
@@ -85,6 +89,7 @@ def _charger_etablissements():
         return _cache_etablissements["data"]
 
     mapping = {}
+    codes = {}
     brut = os.environ.get("ETABLISSEMENTS_JSON", "{}")
     try:
         mapping.update(json.loads(_clean_env_json(brut)))
@@ -98,15 +103,25 @@ def _charger_etablissements():
             for row in ws.get_all_records():
                 cle = str(row.get("Cle_API", "")).strip()
                 sid = str(row.get("Sheet_ID", "")).strip()
+                code = str(row.get("Code_Etablissement", "")).strip()
+                nom = str(row.get("Nom_Etablissement", "")).strip()
                 if cle and sid:
                     mapping[cle] = sid
+                if code and cle:
+                    codes[code.upper()] = {"cle_api": cle, "nom": nom}
         except gspread.exceptions.WorksheetNotFound:
             pass
     except Exception as e:
         print(f"[WARN] Impossible de lire le Registre ETABLISSEMENTS : {e}")
 
-    _cache_etablissements = {"data": mapping, "expires": maintenant + 300}
+    _cache_etablissements = {"data": mapping, "codes": codes, "expires": maintenant + 300}
     return mapping
+
+
+def infos_pour_code(code: str):
+    """Résout un Code_Etablissement (ex: XK3P-9RTQ) vers {cle_api, nom}."""
+    _charger_etablissements()  # s'assure que le cache est à jour
+    return _cache_etablissements["codes"].get(code.strip().upper())
 
 
 def sheet_id_pour_cle_api(cle_api: str):
@@ -173,6 +188,17 @@ def _appel_avec_retry(fonction, tentatives=4, delai_initial=2):
 def health():
     return jsonify({"status": "ok"})
 
+CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # sans 0/O/1/I/L (ambigus à lire/taper)
+
+
+def _generer_code_etablissement(codes_existants):
+    """Génère un code court, lisible, unique parmi ceux déjà attribués."""
+    while True:
+        brut = "".join(secrets.choice(CODE_ALPHABET) for _ in range(8))
+        code = f"{brut[:4]}-{brut[4:]}"
+        if code not in codes_existants:
+            return code
+
 
 @app.route("/enregistrer_etablissement", methods=["POST"])
 def enregistrer_etablissement():
@@ -191,19 +217,53 @@ def enregistrer_etablissement():
         wb = client_gspread().open_by_key(rid)
         try:
             ws = wb.worksheet("ETABLISSEMENTS")
+            entetes = ws.row_values(1)
+            if "Code_Etablissement" not in entetes:
+                ws.update_cell(1, len(entetes) + 1, "Code_Etablissement")
+                idx_code = len(entetes) + 1
+            else:
+                idx_code = entetes.index("Code_Etablissement") + 1
+            lignes_existantes = ws.get_all_values()[1:]
+            codes_existants = {
+                l[idx_code - 1] for l in lignes_existantes if len(l) >= idx_code and l[idx_code - 1]
+            }
         except gspread.exceptions.WorksheetNotFound:
-            ws = wb.add_worksheet("ETABLISSEMENTS", rows=100, cols=4)
-            ws.append_row(["Cle_API", "Sheet_ID", "Nom_Etablissement", "Date_Creation"])
+            ws = wb.add_worksheet("ETABLISSEMENTS", rows=100, cols=5)
+            ws.append_row(["Cle_API", "Sheet_ID", "Nom_Etablissement", "Date_Creation", "Code_Etablissement"])
+            codes_existants = set()
+
+        code_etablissement = _generer_code_etablissement(codes_existants)
 
         ws.append_row([
             cle_api, sheet_id, nom,
-            datetime.now().strftime("%d/%m/%Y %H:%M")
+            datetime.now().strftime("%d/%m/%Y %H:%M"),
+            code_etablissement
         ])
         _cache_etablissements["expires"] = 0
     except Exception as e:
         return jsonify({"erreur": f"Impossible d'écrire dans le registre : {type(e).__name__} - {e}"}), 502
 
-    return jsonify({"cle_api": cle_api, "sheet_id": sheet_id}), 200
+    return jsonify({"cle_api": cle_api, "sheet_id": sheet_id, "code_etablissement": code_etablissement}), 200
+
+
+@app.route("/resoudre_etablissement", methods=["GET"])
+def resoudre_etablissement():
+    """
+    Résout un Code_Etablissement (lisible, ex: XK3P-9RTQ) vers sa Cle_API
+    et le nom de l'établissement (pour affichage). Volontairement sans
+    X-API-Key requis : c'est cette route qui permet justement à une appli
+    web d'obtenir la clé au moment de la connexion. Ne renvoie jamais le
+    Sheet_ID ni aucune autre donnée de l'établissement.
+    """
+    code = request.args.get("code", "").strip()
+    if not code:
+        return jsonify({"erreur": "Paramètre code requis."}), 400
+
+    infos = infos_pour_code(code)
+    if not infos:
+        return jsonify({"erreur": "Code établissement inconnu."}), 404
+
+    return jsonify({"cle_api": infos["cle_api"], "nom_etablissement": infos["nom"]}), 200
 
 
 # ── VERIFIER CONNEXION (Professeurs) ────────────────────────────────────────
