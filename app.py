@@ -131,7 +131,7 @@ def _charger_etablissements():
         pass
 
     try:
-        wb = client_gspread().open_by_key(registre_sheet_id())
+        wb = ouvrir_classeur(registre_sheet_id())
         try:
             ws = wb.worksheet("ETABLISSEMENTS")
             for row in ws.get_all_records():
@@ -233,6 +233,35 @@ def _appel_avec_retry(fonction, tentatives=4, delai_initial=2):
     raise derniere_erreur
 
 
+def ouvrir_classeur(sheet_id, tentatives=4):
+    """
+    Ouvre un classeur avec retry. client_gspread() avance le tourniquet de
+    comptes de service à CHAQUE appel, donc retenter cette fonction essaie
+    automatiquement un AUTRE compte à chaque tentative — utile si le compte
+    tiré au sort n'a pas accès à CE classeur précis, ou renvoie une erreur de
+    permission/serveur transitoire (403, 502, PermissionError). Remplace tout
+    appel direct à client_gspread().open_by_key(...) dans les routes.
+    """
+    derniere_erreur = None
+    for tentative in range(tentatives):
+        try:
+            return client_gspread().open_by_key(sheet_id)
+        except Exception as e:
+            derniere_erreur = e
+            msg = str(e)
+            if "429" in msg or "Quota exceeded" in msg or "Rate limit" in msg:
+                if tentative < tentatives - 1:
+                    pause = 2 * (2 ** tentative)
+                    print(f"[Retry {tentative+1}/{tentatives}] Quota dépassé, attente {pause}s...")
+                    time.sleep(pause)
+                    continue
+            elif tentative < tentatives - 1:
+                print(f"[Retry {tentative+1}/{tentatives}] Échec d'ouverture ({type(e).__name__}), on tente le compte suivant...")
+                continue
+            raise
+    raise derniere_erreur
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  ROUTES
 # ═════════════════════════════════════════════════════════════════════════════
@@ -267,7 +296,7 @@ def enregistrer_etablissement():
 
     try:
         rid = registre_id or registre_sheet_id()
-        wb = client_gspread().open_by_key(rid)
+        wb = ouvrir_classeur(rid)
         try:
             ws = wb.worksheet("ETABLISSEMENTS")
             entetes = ws.row_values(1)
@@ -334,7 +363,7 @@ def verifier_connexion():
         return jsonify({"erreur": "email et mot_de_passe requis."}), 400
 
     try:
-        wb = client_gspread().open_by_key(sheet_id)
+        wb = ouvrir_classeur(sheet_id)
         ws = wb.worksheet("UTILISATEURS")
         utilisateurs = ws.get_all_records()
     except gspread.exceptions.WorksheetNotFound:
@@ -389,7 +418,7 @@ def verifier_parent():
         return jsonify({"erreur": "telephone et code requis."}), 400
 
     try:
-        wb = client_gspread().open_by_key(sheet_id)
+        wb = ouvrir_classeur(sheet_id)
         ws = wb.worksheet("PARENTS")
         parents = ws.get_all_values()
     except gspread.exceptions.WorksheetNotFound:
@@ -426,7 +455,7 @@ def get_records():
     try:
         records = _lire_avec_cache(
             _cle_cache_lecture(sheet_id, onglet, f"records:{head}"),
-            lambda: client_gspread().open_by_key(sheet_id).worksheet(onglet).get_all_records(head=head),
+            lambda: ouvrir_classeur(sheet_id).worksheet(onglet).get_all_records(head=head),
             onglet=onglet,
         )
     except Exception as e:
@@ -451,7 +480,7 @@ def get_values():
     try:
         valeurs = _lire_avec_cache(
             _cle_cache_lecture(sheet_id, onglet, "values"),
-            lambda: client_gspread().open_by_key(sheet_id).worksheet(onglet).get_all_values(),
+            lambda: ouvrir_classeur(sheet_id).worksheet(onglet).get_all_values(),
             onglet=onglet,
         )
     except Exception as e:
@@ -475,7 +504,7 @@ def append_rows():
         return jsonify({"erreur": "onglet et lignes requis."}), 400
 
     try:
-        wb = client_gspread().open_by_key(sheet_id)
+        wb = ouvrir_classeur(sheet_id)
         ws = wb.worksheet(onglet)
         ws.append_rows(lignes, value_input_option="USER_ENTERED")
         _invalider_cache_onglet(sheet_id, onglet)
@@ -503,7 +532,7 @@ def modifier_ligne():
         return jsonify({"erreur": "onglet, valeur_recherche et nouvelle_ligne requis."}), 400
 
     try:
-        wb = client_gspread().open_by_key(sheet_id)
+        wb = ouvrir_classeur(sheet_id)
         ws = wb.worksheet(onglet)
         cell = ws.find(str(valeur_recherche), in_column=colonne_recherche)
         if not cell:
@@ -544,7 +573,7 @@ def supprimer_ligne():
         return jsonify({"erreur": "onglet et valeur_recherche requis."}), 400
 
     try:
-        wb = client_gspread().open_by_key(sheet_id)
+        wb = ouvrir_classeur(sheet_id)
         ws = wb.worksheet(onglet)
         cell = ws.find(str(valeur_recherche), in_column=colonne_recherche)
         if cell:
@@ -571,7 +600,7 @@ def supprimer_ligne_criteres():
         return jsonify({"erreur": "onglet et criteres requis."}), 400
 
     try:
-        wb = client_gspread().open_by_key(sheet_id)
+        wb = ouvrir_classeur(sheet_id)
         ws = wb.worksheet(onglet)
         toutes_lignes = ws.get_all_values()
 
@@ -609,7 +638,7 @@ def supprimer_lignes_plage():
         return jsonify({"erreur": "onglet, debut et fin requis."}), 400
 
     try:
-        wb = client_gspread().open_by_key(sheet_id)
+        wb = ouvrir_classeur(sheet_id)
         ws = wb.worksheet(onglet)
         _appel_avec_retry(lambda: ws.delete_rows(debut, fin))
         _invalider_cache_onglet(sheet_id, onglet)
@@ -639,7 +668,7 @@ def modifier_cellule():
         return jsonify({"erreur": "Tous les paramètres sont requis."}), 400
 
     try:
-        wb = client_gspread().open_by_key(sheet_id)
+        wb = ouvrir_classeur(sheet_id)
         ws = wb.worksheet(onglet)
         toutes_lignes = ws.get_all_values()
 
@@ -673,7 +702,7 @@ def remplacer_lignes_cle():
         return jsonify({"erreur": "onglet, colonne_cle, valeur_cle et nouvelles_lignes requis."}), 400
 
     try:
-        wb = client_gspread().open_by_key(sheet_id)
+        wb = ouvrir_classeur(sheet_id)
         ws = wb.worksheet(onglet)
         toutes_lignes = ws.get_all_values()
 
@@ -715,7 +744,7 @@ def ecrire_cellule():
         return jsonify({"erreur": "onglet, ligne et colonne requis."}), 400
 
     try:
-        wb = client_gspread().open_by_key(sheet_id)
+        wb = ouvrir_classeur(sheet_id)
         ws = wb.worksheet(onglet)
         ws.update_cell(ligne, colonne, valeur)
         _invalider_cache_onglet(sheet_id, onglet)
@@ -723,6 +752,45 @@ def ecrire_cellule():
         return jsonify({"erreur": f"Impossible d'écrire dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
 
     return jsonify({"status": "ok"})
+
+
+# ── ECRIRE PLUSIEURS CELLULES EN UN SEUL APPEL GOOGLE (batch) ──────────────
+@app.route("/ecrire_cellules", methods=["POST"])
+def ecrire_cellules():
+    """
+    Écrit plusieurs cellules (potentiellement dans des lignes différentes) en
+    UNE SEULE requête à l'API Google Sheets, via batch_update — au lieu d'un
+    appel /ecrire_cellule (donc une requête Google) par cellule. Corps
+    attendu : {"onglet": str, "cellules": [{"ligne": int, "colonne": int,
+    "valeur": ...}, ...]}
+    """
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    corps = request.get_json(silent=True) or {}
+    onglet = corps.get("onglet")
+    cellules = corps.get("cellules") or []
+
+    if not onglet or not cellules:
+        return jsonify({"erreur": "onglet et cellules (liste non vide) requis."}), 400
+
+    try:
+        wb = ouvrir_classeur(sheet_id)
+        ws = wb.worksheet(onglet)
+        data = []
+        for c in cellules:
+            ligne, colonne, valeur = c.get("ligne"), c.get("colonne"), c.get("valeur")
+            if ligne is None or colonne is None:
+                continue
+            data.append({"range": gspread.utils.rowcol_to_a1(ligne, colonne), "values": [[valeur]]})
+        if data:
+            ws.batch_update(data)
+        _invalider_cache_onglet(sheet_id, onglet)
+    except Exception as e:
+        return jsonify({"erreur": f"Impossible d'écrire dans l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
+
+    return jsonify({"status": "ok", "nb_cellules": len(data)})
 
 
 # ── ECRIRE PARAM CONFIG ─────────────────────────────────────────────────────
@@ -744,7 +812,7 @@ def ecrire_param_config():
         return jsonify({"erreur": "Paramètres incomplets."}), 400
 
     try:
-        wb = client_gspread().open_by_key(sheet_id)
+        wb = ouvrir_classeur(sheet_id)
         ws = wb.worksheet(onglet)
         data = ws.get_all_values()
 
@@ -788,7 +856,7 @@ def vider_params_prefixe():
         return jsonify({"erreur": "Paramètres incomplets."}), 400
 
     try:
-        wb = client_gspread().open_by_key(sheet_id)
+        wb = ouvrir_classeur(sheet_id)
         ws = wb.worksheet(onglet)
         data = ws.get_all_values()
         for i, row in enumerate(data, start=1):
@@ -816,7 +884,7 @@ def remplacer_onglet():
         return jsonify({"erreur": "onglet et lignes requis."}), 400
 
     try:
-        wb = client_gspread().open_by_key(sheet_id)
+        wb = ouvrir_classeur(sheet_id)
         try:
             ws = wb.worksheet(onglet)
         except gspread.exceptions.WorksheetNotFound:
@@ -856,7 +924,7 @@ def colorer_cellule():
     rgb = couleurs.get(couleur, couleurs[""])
 
     try:
-        wb = client_gspread().open_by_key(sheet_id)
+        wb = ouvrir_classeur(sheet_id)
         ws = wb.worksheet(onglet)
         toutes_lignes = ws.get_all_values()
 
@@ -880,7 +948,7 @@ def registre_annee_active():
         return erreur
 
     try:
-        wb = client_gspread().open_by_key(registre_sheet_id())
+        wb = ouvrir_classeur(registre_sheet_id())
         ws = wb.worksheet("ANNEES")
         lignes = ws.get_all_records()
     except Exception as e:
@@ -906,7 +974,7 @@ def registre_enregistrer_nouvelle_annee():
         return jsonify({"erreur": "annee et spreadsheet_id requis."}), 400
 
     try:
-        wb = client_gspread().open_by_key(registre_sheet_id())
+        wb = ouvrir_classeur(registre_sheet_id())
         ws = wb.worksheet("ANNEES")
         ws.append_row([annee, spreadsheet_id, "Active", ""])
     except Exception as e:
@@ -928,7 +996,7 @@ def registre_archiver_annee():
         return jsonify({"erreur": "annee requis."}), 400
 
     try:
-        wb = client_gspread().open_by_key(registre_sheet_id())
+        wb = ouvrir_classeur(registre_sheet_id())
         ws = wb.worksheet("ANNEES")
         cell = ws.find(annee)
         if not cell:
