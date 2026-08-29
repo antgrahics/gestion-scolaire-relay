@@ -13,6 +13,8 @@ import json
 import bcrypt
 import hashlib
 import secrets
+import itertools
+import threading
 from datetime import date, datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -37,8 +39,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# ── CLIENT GSPREAD (cache mémoire) ─────────────────────────────────────────
-_client_gspread = None
+# ── CLIENT(S) GSPREAD (round-robin multi-comptes) ──────────────────────────
 
 
 def _clean_env_json(raw: str) -> str:
@@ -49,20 +50,53 @@ def _clean_env_json(raw: str) -> str:
     return raw
 
 
-def client_gspread():
-    """Authentifie le compte de service depuis la variable d'environnement."""
-    global _client_gspread
-    if _client_gspread is None:
-        brut = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+_clients_gspread = []
+_clients_cycle = None
+_verrou_clients = threading.Lock()
+
+
+def _construire_clients():
+    """
+    Construit un client gspread par compte de service disponible dans les
+    variables d'environnement : GOOGLE_CREDENTIALS_JSON (compte 1),
+    GOOGLE_CREDENTIALS_JSON_2, GOOGLE_CREDENTIALS_JSON_3, etc.
+
+    Plusieurs comptes = plusieurs quotas Google Sheets distincts (le quota est
+    par compte de service). Chaque compte DOIT avoir accès (Éditeur) au
+    Registre et à chaque classeur d'établissement, sinon les requêtes qui
+    tombent sur ce compte échoueront avec une erreur de permission.
+    """
+    clients = []
+    index = 1
+    while True:
+        nom_var = "GOOGLE_CREDENTIALS_JSON" if index == 1 else f"GOOGLE_CREDENTIALS_JSON_{index}"
+        brut = os.environ.get(nom_var, "")
         if not brut:
-            raise RuntimeError("Variable d'environnement GOOGLE_CREDENTIALS_JSON manquante.")
+            break
         try:
             infos = json.loads(_clean_env_json(brut))
+            creds = Credentials.from_service_account_info(infos, scopes=SCOPES)
+            clients.append(gspread.authorize(creds))
+            print(f"[Auth] Compte de service chargé : {nom_var} ({infos.get('client_email', '?')})")
         except json.JSONDecodeError as e:
-            raise RuntimeError(f"GOOGLE_CREDENTIALS_JSON invalide : {e}")
-        creds = Credentials.from_service_account_info(infos, scopes=SCOPES)
-        _client_gspread = gspread.authorize(creds)
-    return _client_gspread
+            print(f"[Auth] {nom_var} invalide, ignoré : {e}")
+        index += 1
+
+    if not clients:
+        raise RuntimeError("Aucun compte de service Google configuré (GOOGLE_CREDENTIALS_JSON manquante).")
+    return clients
+
+
+def client_gspread():
+    """Retourne le prochain client gspread en tourniquet (round-robin) entre
+    tous les comptes de service configurés, pour répartir la charge sur
+    plusieurs quotas Google distincts plutôt qu'un seul."""
+    global _clients_gspread, _clients_cycle
+    with _verrou_clients:
+        if not _clients_gspread:
+            _clients_gspread = _construire_clients()
+            _clients_cycle = itertools.cycle(_clients_gspread)
+        return next(_clients_cycle)
 
 
 def registre_sheet_id():
@@ -139,20 +173,39 @@ def _verifier_cle_api():
 
 # ── CACHE DE LECTURE ────────────────────────────────────────────────────────
 _cache_lectures = {}
-_DUREE_CACHE_LECTURE = 20
+_DUREE_CACHE_LECTURE_DEFAUT = 20
+
+# Onglets qui changent rarement -> cache plus long, pour économiser le quota
+# Google (une écriture invalide quand même le cache immédiatement, donc pas
+# de risque de servir une donnée périmée après modification). Tout onglet non
+# listé ici garde la durée par défaut (20s), notamment NOTES/PARENTS/ABSENCES/
+# ECOLAGE, où la fraîcheur compte plus (ex: statut d'un compte parent, note
+# qui vient d'être saisie).
+_DUREE_CACHE_PAR_ONGLET = {
+    "CONFIGURATION": 120,
+    "CLASSES": 120,
+    "MATIERES": 120,
+    "PROFESSEURS": 90,
+    "EMPLOI_DU_TEMPS": 120,
+    "UTILISATEURS": 60,
+}
+
+
+def _duree_cache(onglet):
+    return _DUREE_CACHE_PAR_ONGLET.get((onglet or "").strip().upper(), _DUREE_CACHE_LECTURE_DEFAUT)
 
 
 def _cle_cache_lecture(sheet_id, onglet, suffixe=""):
     return (sheet_id, onglet, suffixe)
 
 
-def _lire_avec_cache(cle, fonction_lecture):
+def _lire_avec_cache(cle, fonction_lecture, onglet=None):
     maintenant = time.time()
     entree = _cache_lectures.get(cle)
     if entree and maintenant < entree["expires"]:
         return entree["data"]
     data = _appel_avec_retry(fonction_lecture)
-    _cache_lectures[cle] = {"data": data, "expires": maintenant + _DUREE_CACHE_LECTURE}
+    _cache_lectures[cle] = {"data": data, "expires": maintenant + _duree_cache(onglet)}
     return data
 
 
@@ -373,7 +426,8 @@ def get_records():
     try:
         records = _lire_avec_cache(
             _cle_cache_lecture(sheet_id, onglet, f"records:{head}"),
-            lambda: client_gspread().open_by_key(sheet_id).worksheet(onglet).get_all_records(head=head)
+            lambda: client_gspread().open_by_key(sheet_id).worksheet(onglet).get_all_records(head=head),
+            onglet=onglet,
         )
     except Exception as e:
         return jsonify({"erreur": f"Impossible de lire l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
@@ -397,7 +451,8 @@ def get_values():
     try:
         valeurs = _lire_avec_cache(
             _cle_cache_lecture(sheet_id, onglet, "values"),
-            lambda: client_gspread().open_by_key(sheet_id).worksheet(onglet).get_all_values()
+            lambda: client_gspread().open_by_key(sheet_id).worksheet(onglet).get_all_values(),
+            onglet=onglet,
         )
     except Exception as e:
         return jsonify({"erreur": f"Impossible de lire l'onglet {onglet!r} : {type(e).__name__} - {e}"}), 502
