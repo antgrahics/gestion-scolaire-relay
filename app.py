@@ -124,6 +124,7 @@ def _charger_etablissements():
 
     mapping = {}
     codes = {}
+    infos_par_cle = {}  # NOUVEAU : cle_api -> {registre_sheet_id, nom_etablissement}
     brut = os.environ.get("ETABLISSEMENTS_JSON", "{}")
     try:
         mapping.update(json.loads(_clean_env_json(brut)))
@@ -139,16 +140,21 @@ def _charger_etablissements():
                 sid = str(row.get("Sheet_ID", "")).strip()
                 code = str(row.get("Code_Etablissement", "")).strip()
                 nom = str(row.get("Nom_Etablissement", "")).strip()
+                registre_annees = str(row.get("Registre_Annees_Sheet_ID", "")).strip()
                 if cle and sid:
                     mapping[cle] = sid
                 if code and cle:
                     codes[code.upper()] = {"cle_api": cle, "nom": nom}
+                if cle:
+                    infos_par_cle[cle] = {"registre_sheet_id": registre_annees, "nom_etablissement": nom}
         except gspread.exceptions.WorksheetNotFound:
             pass
     except Exception as e:
         print(f"[WARN] Impossible de lire le Registre ETABLISSEMENTS : {e}")
 
-    _cache_etablissements = {"data": mapping, "codes": codes, "expires": maintenant + 300}
+    _cache_etablissements = {
+        "data": mapping, "codes": codes, "infos": infos_par_cle, "expires": maintenant + 300,
+    }
     return mapping
 
 
@@ -161,6 +167,11 @@ def infos_pour_code(code: str):
 def sheet_id_pour_cle_api(cle_api: str):
     return _charger_etablissements().get(cle_api)
 
+
+def infos_pour_cle_api(cle_api: str):
+    """Renvoie {registre_sheet_id, nom_etablissement} pour une clé API valide."""
+    _charger_etablissements()
+    return _cache_etablissements["infos"].get(cle_api, {})
 
 def _verifier_cle_api():
     """Vérifie le header X-API-Key."""
@@ -288,6 +299,7 @@ def enregistrer_etablissement():
     nom = corps.get("nom_etablissement", "").strip()
     sheet_id = corps.get("sheet_id", "").strip()
     registre_id = corps.get("registre_sheet_id", "").strip()
+    suivi_annees_sheet_id = corps.get("suivi_annees_sheet_id", "").strip()
 
     if not nom or not sheet_id:
         return jsonify({"erreur": "nom_etablissement et sheet_id requis."}), 400
@@ -300,18 +312,21 @@ def enregistrer_etablissement():
         try:
             ws = wb.worksheet("ETABLISSEMENTS")
             entetes = ws.row_values(1)
-            if "Code_Etablissement" not in entetes:
-                ws.update_cell(1, len(entetes) + 1, "Code_Etablissement")
-                idx_code = len(entetes) + 1
-            else:
-                idx_code = entetes.index("Code_Etablissement") + 1
+            for col_manquante in ("Code_Etablissement", "Registre_Annees_Sheet_ID"):
+                if col_manquante not in entetes:
+                    ws.update_cell(1, len(entetes) + 1, col_manquante)
+                    entetes.append(col_manquante)
+            idx_code = entetes.index("Code_Etablissement") + 1
             lignes_existantes = ws.get_all_values()[1:]
             codes_existants = {
                 l[idx_code - 1] for l in lignes_existantes if len(l) >= idx_code and l[idx_code - 1]
             }
         except gspread.exceptions.WorksheetNotFound:
-            ws = wb.add_worksheet("ETABLISSEMENTS", rows=100, cols=5)
-            ws.append_row(["Cle_API", "Sheet_ID", "Nom_Etablissement", "Date_Creation", "Code_Etablissement"])
+            ws = wb.add_worksheet("ETABLISSEMENTS", rows=100, cols=6)
+            ws.append_row([
+                "Cle_API", "Sheet_ID", "Nom_Etablissement", "Date_Creation",
+                "Code_Etablissement", "Registre_Annees_Sheet_ID",
+            ])
             codes_existants = set()
 
         code_etablissement = _generer_code_etablissement(codes_existants)
@@ -319,14 +334,13 @@ def enregistrer_etablissement():
         ws.append_row([
             cle_api, sheet_id, nom,
             datetime.now().strftime("%d/%m/%Y %H:%M"),
-            code_etablissement
+            code_etablissement, suivi_annees_sheet_id,
         ])
         _cache_etablissements["expires"] = 0
     except Exception as e:
         return jsonify({"erreur": f"Impossible d'écrire dans le registre : {type(e).__name__} - {e}"}), 502
 
     return jsonify({"cle_api": cle_api, "sheet_id": sheet_id, "code_etablissement": code_etablissement}), 200
-
 
 @app.route("/resoudre_etablissement", methods=["GET"])
 def resoudre_etablissement():
@@ -347,6 +361,28 @@ def resoudre_etablissement():
 
     return jsonify({"cle_api": infos["cle_api"], "nom_etablissement": infos["nom"]}), 200
 
+
+@app.route("/infos_etablissement", methods=["GET"])
+def infos_etablissement():
+    """
+    Renvoie le Sheet_ID et le Registre_Annees_Sheet_ID pour la clé API
+    fournie en header X-API-Key. Contrairement à /resoudre_etablissement
+    (route ouverte, sans authentification), celle-ci exige une clé API
+    valide — donc ces infos ne sont jamais exposées à quelqu'un qui ne
+    connaît que le Code_Etablissement seul, sans preuve d'identité.
+    """
+    sheet_id, erreur = _verifier_cle_api()
+    if erreur:
+        return erreur
+
+    cle_api = request.headers.get("X-API-Key", "").strip()
+    infos = infos_pour_cle_api(cle_api)
+
+    return jsonify({
+        "sheet_id": sheet_id,
+        "registre_sheet_id": infos.get("registre_sheet_id", ""),
+        "nom_etablissement": infos.get("nom_etablissement", ""),
+    }), 200
 
 # ── VERIFIER CONNEXION (Professeurs) ────────────────────────────────────────
 @app.route("/verifier_connexion", methods=["POST"])
