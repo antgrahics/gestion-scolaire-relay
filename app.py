@@ -453,6 +453,8 @@ def verifier_parent():
     if not telephone or not code:
         return jsonify({"erreur": "telephone et code requis."}), 400
 
+    MAX_TENTATIVES_PARENT = 5
+
     try:
         wb = ouvrir_classeur(sheet_id)
         ws = wb.worksheet("PARENTS")
@@ -462,14 +464,34 @@ def verifier_parent():
     except Exception as e:
         return jsonify({"erreur": f"Impossible de lire le classeur : {type(e).__name__} - {e}"}), 502
 
-    for row in parents[3:]:
-        if len(row) >= 2:
-            tel = row[0].strip().replace(" ", "")
-            code_stocke = row[1].strip()
-            if tel == telephone and code_stocke == code:
-                ids = [x.strip() for x in row[2].replace(";", ",").split(",") if x.strip()]
-                statut = row[3].strip() if len(row) > 3 else "Actif"
-                return jsonify({"valide": True, "id_eleves": ids, "statut": statut})
+    for numero_ligne, row in enumerate(parents[3:], start=4):
+        if len(row) < 2:
+            continue
+        tel = row[0].strip().replace(" ", "")
+        if tel != telephone:
+            continue
+        code_stocke = row[1].strip()
+        # Colonne F (index 5) = Tentatives_Echouees. Persisté dans le Sheet
+        # plutôt qu'en mémoire, pour survivre aux redémarrages du service
+        # (spin-down Render en particulier).
+        try:
+            tentatives = int(row[5].strip()) if len(row) > 5 and row[5].strip() else 0
+        except ValueError:
+            tentatives = 0
+        if tentatives >= MAX_TENTATIVES_PARENT:
+            return jsonify({
+                "erreur": "Trop de tentatives échouées. Contactez l'établissement pour réinitialiser votre code."
+            }), 429
+        if code_stocke == code:
+            if tentatives > 0:
+                ws.update_cell(numero_ligne, 6, "0")
+                _invalider_cache_onglet(sheet_id, "PARENTS")
+            ids = [x.strip() for x in row[2].replace(";", ",").split(",") if x.strip()]
+            statut = row[3].strip() if len(row) > 3 else "Actif"
+            return jsonify({"valide": True, "id_eleves": ids, "statut": statut})
+        ws.update_cell(numero_ligne, 6, str(tentatives + 1))
+        _invalider_cache_onglet(sheet_id, "PARENTS")
+        return jsonify({"erreur": "Code ou téléphone incorrect."}), 401
 
     return jsonify({"erreur": "Code ou téléphone incorrect."}), 401
 
