@@ -244,19 +244,37 @@ def _appel_avec_retry(fonction, tentatives=4, delai_initial=2):
     raise derniere_erreur
 
 
+_cache_classeurs = {}
+_verrou_classeurs = threading.Lock()
+DUREE_CACHE_CLASSEUR = 300  # 5 minutes
+
+
 def ouvrir_classeur(sheet_id, tentatives=4):
     """
-    Ouvre un classeur avec retry. client_gspread() avance le tourniquet de
-    comptes de service à CHAQUE appel, donc retenter cette fonction essaie
-    automatiquement un AUTRE compte à chaque tentative — utile si le compte
-    tiré au sort n'a pas accès à CE classeur précis, ou renvoie une erreur de
-    permission/serveur transitoire (403, 502, PermissionError). Remplace tout
-    appel direct à client_gspread().open_by_key(...) dans les routes.
+    Ouvre un classeur avec retry, et met en cache le classeur déjà ouvert
+    pendant DUREE_CACHE_CLASSEUR secondes — évite de repayer un aller-retour
+    Google (open_by_key) à chaque onglet lu, alors qu'un charger_tout() côté
+    desktop enchaîne une quinzaine d'onglets sur le même classeur en quelques
+    secondes. client_gspread() avance le tourniquet de comptes de service à
+    CHAQUE appel, donc retenter cette fonction essaie automatiquement un
+    AUTRE compte à chaque tentative — utile si le compte tiré au sort n'a
+    pas accès à CE classeur précis, ou renvoie une erreur de permission/
+    serveur transitoire (403, 502, PermissionError). Remplace tout appel
+    direct à client_gspread().open_by_key(...) dans les routes.
     """
+    maintenant = time.time()
+    with _verrou_classeurs:
+        entree = _cache_classeurs.get(sheet_id)
+    if entree and maintenant < entree["expires"]:
+        return entree["wb"]
+
     derniere_erreur = None
     for tentative in range(tentatives):
         try:
-            return client_gspread().open_by_key(sheet_id)
+            wb = client_gspread().open_by_key(sheet_id)
+            with _verrou_classeurs:
+                _cache_classeurs[sheet_id] = {"wb": wb, "expires": maintenant + DUREE_CACHE_CLASSEUR}
+            return wb
         except Exception as e:
             derniere_erreur = e
             msg = str(e)
