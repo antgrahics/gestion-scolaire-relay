@@ -1052,6 +1052,7 @@ def registre_enregistrer_nouvelle_annee():
     _, erreur = _verifier_cle_api()
     if erreur:
         return erreur
+    cle_api = request.headers.get("X-API-Key", "").strip()
 
     corps = request.get_json(silent=True) or {}
     annee = corps.get("annee")
@@ -1065,6 +1066,25 @@ def registre_enregistrer_nouvelle_annee():
         ws.append_row([annee, spreadsheet_id, "Active", ""])
     except Exception as e:
         return jsonify({"erreur": f"Impossible d'écrire dans le registre : {type(e).__name__} - {e}"}), 502
+
+    # Bascule aussi le Sheet_ID "principal" de l'établissement dans le
+    # Registre global (onglet ETABLISSEMENTS) — sinon toutes les routes
+    # relais (get_records, append_rows, modifier_ligne, etc., utilisées
+    # entre autres par les postes secondaires) continueraient de cibler
+    # l'ANCIEN classeur pour toujours, même une fois la nouvelle année
+    # active dans le Suivi_Annees de l'établissement.
+    try:
+        global _cache_etablissements
+        wb_global = ouvrir_classeur(registre_sheet_id())
+        ws_etabs = wb_global.worksheet("ETABLISSEMENTS")
+        cell = ws_etabs.find(cle_api)
+        if cell:
+            entetes = ws_etabs.row_values(1)
+            idx_sheet_id = entetes.index("Sheet_ID") + 1
+            ws_etabs.update_cell(cell.row, idx_sheet_id, spreadsheet_id)
+        _cache_etablissements["expires"] = 0  # force le rechargement au prochain appel
+    except Exception as e:
+        print(f"[WARN] Sheet_ID de l'établissement non mis à jour dans ETABLISSEMENTS : {e}")
 
     return jsonify({"status": "ok"})
 
