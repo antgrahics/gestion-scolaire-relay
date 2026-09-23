@@ -182,6 +182,16 @@ def _verifier_cle_api():
     return sheet_id, None
 
 
+def _registre_annees_sheet_id_pour_requete():
+    """Résout le Registre_Annees_Sheet_ID propre à l'établissement de la
+    requête courante (via son X-API-Key). Retombe sur le Registre global
+    (REGISTRE_SHEET_ID) si l'établissement n'a pas encore été migré vers
+    son propre classeur Suivi_Annees — pour ne rien casser rétroactivement."""
+    cle_api = request.headers.get("X-API-Key", "").strip()
+    infos = infos_pour_cle_api(cle_api)
+    return infos.get("registre_sheet_id") or registre_sheet_id()
+
+
 # ── CACHE DE LECTURE ────────────────────────────────────────────────────────
 _cache_lectures = {}
 _DUREE_CACHE_LECTURE_DEFAUT = 20
@@ -1024,7 +1034,7 @@ def registre_annee_active():
         return erreur
 
     try:
-        wb = ouvrir_classeur(registre_sheet_id())
+        wb = ouvrir_classeur(_registre_annees_sheet_id_pour_requete())
         ws = wb.worksheet("ANNEES")
         lignes = ws.get_all_records()
     except Exception as e:
@@ -1050,7 +1060,7 @@ def registre_enregistrer_nouvelle_annee():
         return jsonify({"erreur": "annee et spreadsheet_id requis."}), 400
 
     try:
-        wb = ouvrir_classeur(registre_sheet_id())
+        wb = ouvrir_classeur(_registre_annees_sheet_id_pour_requete())
         ws = wb.worksheet("ANNEES")
         ws.append_row([annee, spreadsheet_id, "Active", ""])
     except Exception as e:
@@ -1072,7 +1082,7 @@ def registre_archiver_annee():
         return jsonify({"erreur": "annee requis."}), 400
 
     try:
-        wb = ouvrir_classeur(registre_sheet_id())
+        wb = ouvrir_classeur(_registre_annees_sheet_id_pour_requete())
         ws = wb.worksheet("ANNEES")
         cell = ws.find(annee)
         if not cell:
